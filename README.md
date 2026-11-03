@@ -38,11 +38,11 @@ post_remove  = "/usr/sbin/saq --prune --update-default"
 ## Choosing modules
 
 `share/saq/modules.list` is the default set. To change it on a
-system, add files to `/etc/faseela/initramfs.d/*.list`: one or more module
+system, add files to `/etc/saq/modules.d/*.list`: one or more module
 names per line, `#` for comments, and `!name` to drop a default.
 
 ```
-# /etc/faseela/initramfs.d/local.list
+# /etc/saq/modules.d/local.list
 nvidia-drm
 !btrfs
 ```

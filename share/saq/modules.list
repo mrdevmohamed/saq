@@ -4,7 +4,7 @@
 # resolved from the kernel's modules.dep, so only list what you need to name.
 # Modules that are built into the kernel are skipped silently.
 #
-# Local additions go in <root>/etc/faseela/initramfs.d/*.list. A name starting
+# Local additions go in <root>/etc/saq/modules.d/*.list. A name starting
 # with '!' there removes a module from this list ("!btrfs").
 
 # SATA / NVMe / SCSI disks

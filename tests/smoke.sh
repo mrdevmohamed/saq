@@ -122,14 +122,14 @@ cp "$ROOT/boot/initramfs-6.2.0-test.img" "$T/first.img"
 run --kernel 6.2.0-test
 check "builds are reproducible" cmp -s "$T/first.img" "$ROOT/boot/initramfs-6.2.0-test.img"
 
-mkdir -p "$ROOT/etc/faseela/initramfs.d"
-printf '# local override\n!ext4\n' >"$ROOT/etc/faseela/initramfs.d/local.list"
+mkdir -p "$ROOT/etc/saq/modules.d"
+printf '# local override\n!ext4\n' >"$ROOT/etc/saq/modules.d/local.list"
 run --kernel 6.2.0-test
 rm -rf "$X"
 mkdir "$X"
 (cd "$X" && gzip -dc "$ROOT/boot/initramfs-6.2.0-test.img" | cpio -idm --quiet)
-check "'!module' in initramfs.d removes a module" test ! -f "$X/lib/modules/6.2.0-test/kernel/fs/ext4.ko"
-rm "$ROOT/etc/faseela/initramfs.d/local.list"
+check "'!module' in modules.d removes a module" test ! -f "$X/lib/modules/6.2.0-test/kernel/fs/ext4.ko"
+rm "$ROOT/etc/saq/modules.d/local.list"
 
 rm "$ROOT/boot/vmlinuz-6.1.0-test"
 run --prune --update-default

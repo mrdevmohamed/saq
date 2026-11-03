@@ -58,7 +58,7 @@ Usage: saq [OPTIONS]
   -h, --help             Show this help.
 
 Modules come from the data directory's modules.list plus
-<root>/etc/faseela/initramfs.d/*.list. Set SOURCE_DATE_EPOCH to stamp the
+<root>/etc/saq/modules.d/*.list. Set SOURCE_DATE_EPOCH to stamp the
 image with a fixed time; without it the stamp is 0, so equal inputs give
 byte-identical images.
 USAGE
@@ -204,7 +204,7 @@ load_module_list() {
     local -A excluded=() seen=()
     local f line tok name
     [[ -r "$SHARE/modules.list" ]] || die "module list not found: $SHARE/modules.list"
-    files+=("$ROOT"/etc/faseela/initramfs.d/*.list)
+    files+=("$ROOT"/etc/saq/modules.d/*.list)
     for f in "${files[@]}"; do
         [[ -r "$f" ]] || continue
         while IFS= read -r line || [[ -n "$line" ]]; do
