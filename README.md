@@ -2,7 +2,7 @@
 
 Initramfs tool for the [Faseela](https://github.com/mrdevmohamed/faseela) distro.
 
-`faseela-mkinitramfs` builds `/boot/initramfs-VERSION.img` for every kernel
+`saq` builds `/boot/initramfs-VERSION.img` for every kernel
 installed in `/boot`: a static BusyBox, the storage and filesystem modules from
 `modules.list` (with their dependencies and firmware) and a small `/init` that
 mounts the root filesystem and hands over to runit. The live ISO keeps its own
@@ -14,15 +14,15 @@ tested and packaged on its own.
 ## Usage
 
 ```
-faseela-mkinitramfs [--all | --kernel VERSION] [--prune] [--update-default]
+saq [--all | --kernel VERSION] [--prune] [--update-default]
                     [--root DIR] [--dry-run] [--quiet]
 ```
 
 The kernel package calls it from its hooks:
 
 ```
-post_install = "/usr/sbin/faseela-mkinitramfs --all --prune --update-default"
-post_remove  = "/usr/sbin/faseela-mkinitramfs --prune --update-default"
+post_install = "/usr/sbin/saq --all --prune --update-default"
+post_remove  = "/usr/sbin/saq --prune --update-default"
 ```
 
 - `--all` builds every kernel in a separate process, so a broken old kernel
@@ -37,7 +37,7 @@ post_remove  = "/usr/sbin/faseela-mkinitramfs --prune --update-default"
 
 ## Choosing modules
 
-`share/faseela-initramfs/modules.list` is the default set. To change it on a
+`share/saq/modules.list` is the default set. To change it on a
 system, add files to `/etc/faseela/initramfs.d/*.list`: one or more module
 names per line, `#` for comments, and `!name` to drop a default.
 
@@ -90,8 +90,8 @@ image; that still has to be tried in QEMU or on hardware.
 ## Layout
 
 ```
-src/faseela-mkinitramfs          the generator   -> /usr/sbin/
-share/faseela-initramfs/init     /init of the image
-share/faseela-initramfs/modules.list
+src/saq          the generator   -> /usr/sbin/
+share/saq/init     /init of the image
+share/saq/modules.list
 tests/smoke.sh
 ```

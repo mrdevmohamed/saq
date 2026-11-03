@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# faseela-mkinitramfs - build versioned initramfs images for installed kernels.
+# saq - build versioned initramfs images for installed kernels.
 #
 # For every /boot/vmlinuz-VERSION it writes /boot/initramfs-VERSION.img holding
 # a static BusyBox, the storage/filesystem modules named in modules.list (plus
@@ -10,14 +10,14 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly PROG="faseela-mkinitramfs"
+readonly PROG="saq"
 readonly VERSION="1.1.0"
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SELF
-# Installed: /usr/sbin/faseela-mkinitramfs -> /usr/share/faseela-initramfs.
-# In a checkout: src/faseela-mkinitramfs -> share/faseela-initramfs.
-SHARE="${FASEELA_INITRAMFS_SHARE:-${SELF%/*}/../share/faseela-initramfs}"
+# Installed: /usr/sbin/saq -> /usr/share/saq.
+# In a checkout: src/saq -> share/saq.
+SHARE="${SAQ_SHARE:-${SELF%/*}/../share/saq}"
 
 # Applets the initramfs cannot work without, and nice-to-have rescue tools that
 # are linked only when the BusyBox in use provides them.
@@ -45,7 +45,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 
 usage() {
     cat <<'USAGE'
-Usage: faseela-mkinitramfs [OPTIONS]
+Usage: saq [OPTIONS]
   --all                  Build an image for every installed kernel (default).
   --kernel VERSION       Build an image for one installed kernel.
   --prune                Remove images whose kernel is no longer installed.
@@ -314,7 +314,7 @@ build_one() {
     [[ -s "$KMODDIR/modules.dep" ]] || die "missing or empty module dependency file: $KMODDIR/modules.dep"
 
     VER="$ver"
-    WORK="$(mktemp -d "${TMPDIR:-/tmp}/faseela-initramfs.XXXXXX")"
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/saq.XXXXXX")"
     TREE="$WORK/tree"
     MODULES_TREE="$TREE/lib/modules/$ver"
     mkdir -p "$TREE"/{bin,dev,proc,sys,run,etc,newroot,lib/firmware} "$MODULES_TREE"
@@ -464,10 +464,10 @@ prune_images() {
 }
 
 # ---- main --------------------------------------------------------------------------
-if [[ "$DRY_RUN" != 1 && -z "${FASEELA_MKINITRAMFS_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
-    exec 9>"$BOOT/.faseela-mkinitramfs.lock"
+if [[ "$DRY_RUN" != 1 && -z "${SAQ_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
+    exec 9>"$BOOT/.saq.lock"
     flock -n 9 || die "another $PROG is already running"
-    export FASEELA_MKINITRAMFS_LOCKED=1
+    export SAQ_LOCKED=1
 fi
 
 status=0

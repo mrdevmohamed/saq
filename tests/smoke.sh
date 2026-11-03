@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for faseela-mkinitramfs on a fake root filesystem.
+# Smoke test for saq on a fake root filesystem.
 #
 # Needs: bash, gcc, cpio, gzip, xz, zstd, kmod (depmod/modinfo) and a *static*
 # busybox on the host that has findfs/modprobe/switch_root (Debian/Ubuntu:
@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEN="$HERE/src/faseela-mkinitramfs"
+GEN="$HERE/src/saq"
 
 for tool in gcc cpio gzip xz zstd depmod modinfo busybox; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -74,7 +74,7 @@ make_kernel 6.1.0-test
 make_kernel 6.2.0-test
 
 # ---- tests --------------------------------------------------------------------
-busybox sh -n "$HERE/share/faseela-initramfs/init" && ok "init script parses with BusyBox ash"
+busybox sh -n "$HERE/share/saq/init" && ok "init script parses with BusyBox ash"
 check "--help works" "$GEN" --help
 check "--version works" "$GEN" --version
 rc=0
@@ -103,7 +103,7 @@ mkdir "$X"
 (cd "$X" && gzip -dc "$ROOT/boot/initramfs-6.2.0-test.img" | cpio -idm --quiet)
 M="$X/lib/modules/6.2.0-test/kernel"
 check "/init is executable" test -x "$X/init"
-check "/init matches the shipped script" cmp -s "$X/init" "$HERE/share/faseela-initramfs/init"
+check "/init matches the shipped script" cmp -s "$X/init" "$HERE/share/saq/init"
 check "busybox is included" test -x "$X/bin/busybox"
 check "applet links exist" test "$(readlink "$X/bin/switch_root")" = busybox
 check "findfs applet is linked" test -L "$X/bin/findfs"
