@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# faseela-mkinitramfs - build versioned initramfs images for installed kernels.
+#
+# For every /boot/vmlinuz-VERSION it writes /boot/initramfs-VERSION.img holding
+# a static BusyBox, the storage/filesystem modules named in modules.list (plus
+# their dependencies and firmware) and the /init script from the data directory.
+# The live ISO has its own initramfs; this tool is for installed systems.
+#
+# The generator itself never installs hooks: the kernel package calls it.
+set -Eeuo pipefail
+shopt -s nullglob
+
+readonly PROG="faseela-mkinitramfs"
+readonly VERSION="1.1.0"
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+# Installed: /usr/sbin/faseela-mkinitramfs -> /usr/share/faseela-initramfs.
+# In a checkout: src/faseela-mkinitramfs -> share/faseela-initramfs.
+SHARE="${FASEELA_INITRAMFS_SHARE:-${SELF%/*}/../share/faseela-initramfs}"
+
+# Applets the initramfs cannot work without, and nice-to-have rescue tools that
+# are linked only when the BusyBox in use provides them.
+readonly -a REQUIRED_APPLETS=(sh mount umount mkdir mknod switch_root modprobe findfs sleep cat)
+readonly -a OPTIONAL_APPLETS=(ls ln rm cp mv sync dmesg lsmod insmod rmmod blkid)
+
+ROOT="/"
+ACTION=""
+KERNEL_VERSION=""
+DO_PRUNE=0
+UPDATE_DEFAULT=0
+DRY_RUN=0
+QUIET=0
+BOOT=""
+WORK=""
+TMPOUT=""
+
+die() {
+    echo "$PROG: $*" >&2
+    exit 1
+}
+warn() { echo "$PROG: warning: $*" >&2; }
+info() { [[ "$QUIET" == 1 ]] || echo "== $PROG: $*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+usage() {
+    cat <<'USAGE'
+Usage: faseela-mkinitramfs [OPTIONS]
+  --all                  Build an image for every installed kernel (default).
+  --kernel VERSION       Build an image for one installed kernel.
+  --prune                Remove images whose kernel is no longer installed.
+  --update-default       Atomically point /boot/vmlinuz and /boot/initramfs.img
+                         at the newest kernel that has an image.
+  --root DIR             Operate on another root filesystem (default: /).
+  --dry-run              Print planned actions without changing anything.
+  --quiet                Only print warnings and errors.
+  --version              Print the version and exit.
+  -h, --help             Show this help.
+
+Modules come from the data directory's modules.list plus
+<root>/etc/faseela/initramfs.d/*.list. Set SOURCE_DATE_EPOCH to stamp the
+image with a fixed time; without it the stamp is 0, so equal inputs give
+byte-identical images.
+USAGE
+}
+
+# shellcheck disable=SC2317 # runs from the EXIT trap
+cleanup() {
+    if [[ -n "$TMPOUT" ]]; then rm -f -- "$TMPOUT"; fi
+    if [[ -n "$WORK" ]]; then rm -rf -- "$WORK"; fi
+}
+trap cleanup EXIT
+
+# ---- option parsing -------------------------------------------------------
+explicit_action=0
+set_action() {
+    [[ "$explicit_action" == 0 ]] || die "choose only one of --all or --kernel"
+    ACTION="$1"
+    explicit_action=1
+}
+while (($#)); do
+    case "$1" in
+    --all)
+        set_action all
+        shift
+        ;;
+    --kernel)
+        [[ $# -ge 2 ]] || die "--kernel needs a version"
+        set_action one
+        KERNEL_VERSION="$2"
+        shift 2
+        ;;
+    --kernel=*)
+        set_action one
+        KERNEL_VERSION="${1#--kernel=}"
+        shift
+        ;;
+    --prune)
+        DO_PRUNE=1
+        shift
+        ;;
+    --update-default)
+        UPDATE_DEFAULT=1
+        shift
+        ;;
+    --root)
+        [[ $# -ge 2 ]] || die "--root needs a directory"
+        ROOT="$2"
+        shift 2
+        ;;
+    --root=*)
+        ROOT="${1#--root=}"
+        shift
+        ;;
+    --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+    --quiet | -q)
+        QUIET=1
+        shift
+        ;;
+    --version)
+        echo "$PROG $VERSION"
+        exit 0
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "$PROG: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+done
+
+# With no explicit build action, build everything - except for pure lifecycle
+# calls such as "--prune --update-default" from a package-removal hook.
+if [[ "$explicit_action" == 0 && "$DO_PRUNE" == 0 ]]; then ACTION="all"; fi
+
+[[ -d "$ROOT" ]] || die "root does not exist: $ROOT"
+ROOT="$(cd "$ROOT" && pwd -P)"
+BOOT="$ROOT/boot"
+BUSYBOX="$ROOT/usr/bin/busybox"
+[[ -d "$BOOT" ]] || die "no boot directory: $BOOT"
+
+# ---- helpers ----------------------------------------------------------------
+
+# Print a module file's contents decompressed, whatever its suffix.
+decompress() {
+    case "$1" in
+    *.xz)
+        need xz
+        xz -dc -- "$1"
+        ;;
+    *.zst)
+        need zstd
+        zstd -q -dc -- "$1"
+        ;;
+    *.gz) gzip -dc -- "$1" ;;
+    *) cat -- "$1" ;;
+    esac
+}
+
+# foo-bar.ko.xz -> foo_bar
+module_name() {
+    local n="${1##*/}"
+    n="${n%.xz}"
+    n="${n%.zst}"
+    n="${n%.gz}"
+    n="${n%.ko}"
+    printf '%s' "${n//-/_}"
+}
+
+is_static_elf() {
+    local f="$1"
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -h -- "$f" >/dev/null 2>&1 || return 1
+        if LC_ALL=C readelf -lW -- "$f" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+            return 1
+        fi
+    else
+        LC_ALL=C ldd -- "$f" 2>&1 | grep -qiE 'not a dynamic executable|statically linked'
+    fi
+}
+
+check_busybox() {
+    local applet applets
+    [[ -x "$BUSYBOX" ]] || die "static BusyBox is missing: $BUSYBOX"
+    is_static_elf "$BUSYBOX" ||
+        die "$BUSYBOX is not a static binary; the initramfs cannot rely on installed libraries"
+    applets="$("$BUSYBOX" --list)" || die "cannot run $BUSYBOX"
+    for applet in "${REQUIRED_APPLETS[@]}"; do
+        grep -qx "$applet" <<<"$applets" || die "BusyBox is missing the '$applet' applet; rebuild busybox"
+    done
+    BUSYBOX_APPLETS="$applets"
+}
+
+# Fills REQUESTED with the module names to include, in order.
+load_module_list() {
+    local -a files=("$SHARE/modules.list") tokens=() toks=()
+    local -A excluded=() seen=()
+    local f line tok name
+    [[ -r "$SHARE/modules.list" ]] || die "module list not found: $SHARE/modules.list"
+    files+=("$ROOT"/etc/faseela/initramfs.d/*.list)
+    for f in "${files[@]}"; do
+        [[ -r "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%%#*}"
+            toks=()
+            read -ra toks <<<"$line" || true
+            if ((${#toks[@]})); then tokens+=("${toks[@]}"); fi
+        done <"$f"
+    done
+    for tok in "${tokens[@]}"; do
+        if [[ "$tok" == '!'* ]]; then
+            name="${tok#!}"
+            excluded["${name//-/_}"]=1
+        fi
+    done
+    REQUESTED=()
+    for tok in "${tokens[@]}"; do
+        [[ "$tok" != '!'* ]] || continue
+        name="${tok//-/_}"
+        [[ "$name" =~ ^[A-Za-z0-9_]+$ ]] || {
+            warn "ignoring invalid module name: $tok"
+            continue
+        }
+        [[ -z "${excluded[$name]:-}" && -z "${seen[$name]:-}" ]] || continue
+        seen["$name"]=1
+        REQUESTED+=("$name")
+    done
+}
+
+# ---- building one image -------------------------------------------------------
+declare -A DEP_PATH=() DEP_DEPS=() STAGED_PATH=()
+declare -a REQUESTED=() STAGED_NAMES=()
+
+stage_module_file() {
+    local rel="$1" src out dest
+    [[ -z "${STAGED_PATH[$rel]:-}" ]] || return 0
+    case "$rel" in
+    *.ko | *.ko.xz | *.ko.zst | *.ko.gz) ;;
+    *)
+        warn "unsupported module file name: $rel"
+        return 0
+        ;;
+    esac
+    src="$KMODDIR/$rel"
+    [[ -f "$src" ]] || die "module listed in modules.dep is missing: $src"
+    out="${rel%.xz}"
+    out="${out%.zst}"
+    out="${out%.gz}"
+    dest="$MODULES_TREE/$out"
+    mkdir -p -- "${dest%/*}"
+    decompress "$src" >"$dest"
+    STAGED_PATH["$rel"]=1
+}
+
+# Copy firmware matching a modinfo "firmware:" entry (may contain globs, may be
+# stored compressed) into the image, always uncompressed.
+stage_firmware() {
+    local pattern="$1" base suffix rel out dest found=0
+    if [[ "$pattern" == /* || "/$pattern/" == *"/../"* ]]; then
+        warn "ignoring unsafe firmware path: $pattern"
+        return 0
+    fi
+    for base in "$ROOT/usr/lib/firmware" "$ROOT/lib/firmware"; do
+        [[ -d "$base" ]] || continue
+        for suffix in "" .xz .zst .gz; do
+            while IFS= read -r rel; do
+                [[ -n "$rel" && -f "$base/$rel" ]] || continue
+                out="${rel%"$suffix"}"
+                dest="$TREE/lib/firmware/$out"
+                found=1
+                [[ ! -e "$dest" ]] || continue
+                mkdir -p -- "${dest%/*}"
+                decompress "$base/$rel" >"$dest"
+            done < <(cd "$base" && { compgen -G "$pattern$suffix" || true; })
+        done
+        if [[ "$found" == 1 ]]; then break; fi
+    done
+    if [[ "$found" == 0 ]]; then warn "firmware not installed for $VER: $pattern"; fi
+}
+
+build_one() {
+    local ver="$1"
+    local kernel="$BOOT/vmlinuz-$ver" out="$BOOT/initramfs-$ver.img"
+    local line path name rel deps fw epoch applet
+    local -a modfiles=() cpio_opts=(--null -o -H newc --quiet --owner=0:0)
+
+    [[ "$ver" =~ ^[A-Za-z0-9._+-]+$ ]] || die "unsafe kernel version: $ver"
+    [[ -f "$kernel" ]] || die "kernel image not found: $kernel"
+    KMODDIR="$ROOT/lib/modules/$ver"
+    [[ -d "$KMODDIR" ]] || die "module directory not found: $KMODDIR"
+
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "would build $out from $kernel and $KMODDIR"
+        return 0
+    fi
+
+    for name in cpio gzip find sort depmod modinfo mktemp touch; do need "$name"; done
+    check_busybox
+    load_module_list
+
+    # Dependency data of the installed kernel; created on demand, like a
+    # kernel package without its own depmod step would need.
+    if [[ ! -s "$KMODDIR/modules.dep" ]]; then
+        info "generating module dependency data for $ver"
+        depmod -b "$ROOT" "$ver" || die "depmod failed for kernel $ver"
+    fi
+    [[ -s "$KMODDIR/modules.dep" ]] || die "missing or empty module dependency file: $KMODDIR/modules.dep"
+
+    VER="$ver"
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/faseela-initramfs.XXXXXX")"
+    TREE="$WORK/tree"
+    MODULES_TREE="$TREE/lib/modules/$ver"
+    mkdir -p "$TREE"/{bin,dev,proc,sys,run,etc,newroot,lib/firmware} "$MODULES_TREE"
+
+    cp -- "$BUSYBOX" "$TREE/bin/busybox"
+    for applet in "${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}"; do
+        if grep -qx "$applet" <<<"$BUSYBOX_APPLETS"; then ln -s busybox "$TREE/bin/$applet"; fi
+    done
+    # Console nodes need root; without them the kernel opens /dev/console late.
+    mknod -m 600 "$TREE/dev/console" c 5 1 2>/dev/null || true
+    mknod -m 666 "$TREE/dev/null" c 1 3 2>/dev/null || true
+
+    # Read the dependency index (modules.dep lists the full closure per module).
+    DEP_PATH=()
+    DEP_DEPS=()
+    STAGED_PATH=()
+    STAGED_NAMES=()
+    while IFS= read -r line; do
+        [[ "$line" == *:* ]] || continue
+        path="${line%%:*}"
+        path="${path#/lib/modules/"$ver"/}"
+        deps="${line#*:}"
+        name="$(module_name "$path")"
+        DEP_PATH["$name"]="$path"
+        DEP_DEPS["$name"]="${deps//"/lib/modules/$ver/"/}"
+    done <"$KMODDIR/modules.dep"
+
+    for name in "${REQUESTED[@]}"; do
+        # Built into the kernel (or not built at all): nothing to stage.
+        [[ -n "${DEP_PATH[$name]:-}" ]] || continue
+        # shellcheck disable=SC2086 # word splitting of the dependency list is intended
+        for rel in ${DEP_DEPS[$name]}; do stage_module_file "$rel"; done
+        stage_module_file "${DEP_PATH[$name]}"
+        STAGED_NAMES+=("$name")
+    done
+    # depmod wants these three; only the builtin list is of any use to modprobe.
+    if [[ -f "$KMODDIR/modules.builtin" ]]; then
+        cp -- "$KMODDIR/modules.builtin" "$MODULES_TREE/modules.builtin"
+    else
+        : >"$MODULES_TREE/modules.builtin"
+    fi
+    : >"$MODULES_TREE/modules.order"
+    : >"$MODULES_TREE/modules.builtin.modinfo"
+
+    # Let depmod describe exactly what is in the image: correct for the
+    # decompressed files and for BusyBox's modprobe.
+    depmod -b "$TREE" "$ver" || die "depmod failed for the staged modules of $ver"
+    [[ -f "$MODULES_TREE/modules.dep" ]] || die "depmod produced no modules.dep for $ver"
+
+    while IFS= read -r -d '' path; do modfiles+=("$path"); done \
+        < <(find "$MODULES_TREE" -type f -name '*.ko' -print0)
+    if ((${#modfiles[@]})); then
+        while IFS= read -r fw; do
+            [[ -z "$fw" ]] || stage_firmware "$fw"
+        done < <(modinfo -F firmware "${modfiles[@]}" 2>/dev/null | sort -u || true)
+    else
+        info "no loadable storage modules for $ver (everything built in?)"
+    fi
+
+    if ((${#STAGED_NAMES[@]})); then printf '%s\n' "${STAGED_NAMES[@]}" >"$TREE/etc/modules"; else : >"$TREE/etc/modules"; fi
+    [[ -r "$SHARE/init" ]] || die "init script not found: $SHARE/init"
+    cp -- "$SHARE/init" "$TREE/init"
+    chmod 755 "$TREE/init"
+
+    epoch="${SOURCE_DATE_EPOCH:-0}"
+    [[ "$epoch" =~ ^[0-9]+$ ]] || die "SOURCE_DATE_EPOCH must be a number: $epoch"
+    find "$TREE" -exec touch -h -d "@$epoch" {} +
+    if cpio --help 2>&1 | grep -q -- '--reproducible'; then cpio_opts+=(--reproducible); fi
+
+    TMPOUT="$BOOT/.initramfs-$ver.img.tmp.$$"
+    if ! (cd "$TREE" && find . -print0 | LC_ALL=C sort -z | cpio "${cpio_opts[@]}") | gzip -n -9 >"$TMPOUT"; then
+        die "failed to create the archive for $ver"
+    fi
+    [[ -s "$TMPOUT" ]] || die "generated initramfs is empty for $ver"
+    gzip -t -- "$TMPOUT" || die "generated initramfs is corrupt for $ver"
+    chmod 644 "$TMPOUT"
+    mv -f -- "$TMPOUT" "$out"
+    TMPOUT=""
+    info "created $out ($(du -h -- "$out" | cut -f1), ${#STAGED_NAMES[@]} modules requested)"
+    rm -rf -- "$WORK"
+    WORK=""
+}
+
+# ---- kernels, default links, pruning --------------------------------------------
+installed_versions() {
+    local f
+    for f in "$BOOT"/vmlinuz-*; do
+        [[ -f "$f" ]] && printf '%s\n' "${f##*/vmlinuz-}"
+    done
+}
+
+# Atomically point $BOOT/NAME at TARGET (a file in $BOOT). Falls back to a copy
+# on filesystems without symlinks, such as a FAT boot partition.
+publish_default() {
+    local name="$1" target="$2" tmp="$BOOT/.$1.new.$$"
+    if ln -sfn -- "$target" "$tmp" 2>/dev/null && mv -Tf -- "$tmp" "$BOOT/$name"; then return 0; fi
+    rm -f -- "$tmp"
+    if ! cp -f -- "$BOOT/$target" "$tmp" || ! mv -f -- "$tmp" "$BOOT/$name"; then
+        rm -f -- "$tmp"
+        die "cannot update $BOOT/$name"
+    fi
+}
+
+update_default() {
+    local ver="" cand
+    local -a versions=()
+    mapfile -t versions < <(installed_versions | sort -Vr)
+    for cand in "${versions[@]}"; do
+        # A dry run builds nothing, so judge by the kernels alone.
+        if [[ -s "$BOOT/initramfs-$cand.img" || "$DRY_RUN" == 1 ]]; then
+            ver="$cand"
+            break
+        fi
+    done
+    if [[ -z "$ver" ]]; then
+        warn "no kernel with an initramfs image in $BOOT; leaving the default boot files alone"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "would point $BOOT/vmlinuz and $BOOT/initramfs.img at version $ver"
+        return 0
+    fi
+    publish_default vmlinuz "vmlinuz-$ver"
+    publish_default initramfs.img "initramfs-$ver.img"
+    info "default kernel is $ver"
+}
+
+prune_images() {
+    local image version leftover
+    for image in "$BOOT"/initramfs-*.img; do
+        version="${image##*/initramfs-}"
+        version="${version%.img}"
+        [[ ! -f "$BOOT/vmlinuz-$version" ]] || continue
+        if [[ "$DRY_RUN" == 1 ]]; then
+            echo "would remove stale image $image"
+        else
+            rm -f -- "$image"
+            info "removed stale image $image"
+        fi
+    done
+    # Leftovers of an interrupted run (the lock keeps live ones from racing us).
+    if [[ "$DRY_RUN" != 1 ]]; then
+        for leftover in "$BOOT"/.initramfs-*.img.tmp.* "$BOOT"/.vmlinuz.new.* "$BOOT"/.initramfs.img.new.*; do
+            rm -f -- "$leftover"
+        done
+    fi
+}
+
+# ---- main --------------------------------------------------------------------------
+if [[ "$DRY_RUN" != 1 && -z "${FASEELA_MKINITRAMFS_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
+    exec 9>"$BOOT/.faseela-mkinitramfs.lock"
+    flock -n 9 || die "another $PROG is already running"
+    export FASEELA_MKINITRAMFS_LOCKED=1
+fi
+
+status=0
+case "$ACTION" in
+all)
+    mapfile -t ALL_VERSIONS < <(installed_versions | sort -V)
+    ((${#ALL_VERSIONS[@]})) || die "no $BOOT/vmlinuz-* kernels found"
+    passthru=()
+    [[ "$DRY_RUN" != 1 ]] || passthru+=(--dry-run)
+    [[ "$QUIET" != 1 ]] || passthru+=(--quiet)
+    failed=()
+    # One process per kernel: a broken old kernel must not stop the new one.
+    for version in "${ALL_VERSIONS[@]}"; do
+        if ! "$BASH" "$SELF" --kernel "$version" --root "$ROOT" "${passthru[@]+"${passthru[@]}"}"; then
+            failed+=("$version")
+        fi
+    done
+    if ((${#failed[@]})); then
+        warn "failed to build an image for: ${failed[*]}"
+        status=1
+    fi
+    ;;
+one)
+    build_one "$KERNEL_VERSION"
+    ;;
+esac
+
+if [[ "$DO_PRUNE" == 1 ]]; then prune_images; fi
+if [[ "$UPDATE_DEFAULT" == 1 ]]; then update_default; fi
+exit "$status"

@@ -1,0 +1,32 @@
+# Kernel modules every Faseela initramfs tries to include (and load at boot).
+#
+# One or more module names per line, '#' starts a comment. Dependencies are
+# resolved from the kernel's modules.dep, so only list what you need to name.
+# Modules that are built into the kernel are skipped silently.
+#
+# Local additions go in <root>/etc/faseela/initramfs.d/*.list. A name starting
+# with '!' there removes a module from this list ("!btrfs").
+
+# SATA / NVMe / SCSI disks
+ahci ata_piix nvme nvme_core sd_mod scsi_mod sr_mod cdrom sg
+
+# virtual machines
+virtio virtio_ring virtio_pci virtio_blk virtio_scsi virtio_fs
+xen_blkfront xen_netfront vmw_pvscsi
+
+# USB storage
+usb_common usbcore usb_storage uas
+xhci_pci xhci_hcd ehci_pci ehci_hcd ohci_pci ohci_hcd uhci_hcd
+
+# eMMC / SD card readers
+mmc_core mmc_block sdhci sdhci_pci sdhci_acpi
+
+# filesystems
+iso9660 udf squashfs overlay loop
+ext4 btrfs xfs f2fs ntfs3 fat vfat
+nls_cp437 nls_iso8859_1 nls_utf8
+
+# device-mapper and software RAID (the unlock/assembly logic itself is not
+# implemented yet, only the kernel side is available)
+dm_mod dm_crypt dm_snapshot dm_mirror dm_thin_pool dm_integrity
+md_mod raid0 raid1 raid10 raid456

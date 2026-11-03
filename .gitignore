@@ -1,0 +1,3 @@
+*.img
+*.tmp
+.faseela-mkinitramfs.lock
