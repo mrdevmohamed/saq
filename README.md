@@ -31,9 +31,21 @@ post_remove  = "/usr/sbin/saq --prune --update-default"
 - `--update-default` points `/boot/vmlinuz` and `/boot/initramfs.img` at the
   newest kernel that has an image, atomically. On a filesystem without symlinks
   (a FAT `/boot`) it copies the files instead.
+- `--update-default` also keeps the pair it replaces as `/boot/vmlinuz.old` and `/boot/initramfs.img.old`. They are real files that no package owns: the kernel package's hook runs after the old kernel is already gone, so saq copies each pair (`*.snap`) when it publishes it and promotes that copy to `*.old` when the next, different pair is published. It is "the previous default", not "known good". The initramfs holds the storage modules, so it boots, but `/lib/modules` of an older release is gone and only built-in drivers are available. `--no-keep-old` turns this off. Costs about one kernel plus one initramfs of space for each of the two copies; if `/boot` is full only a warning is printed.
 - `--root DIR` works on another root, e.g. a freshly installed system.
 - Images are reproducible: equal inputs give byte-identical output. Set
   `SOURCE_DATE_EPOCH` to stamp them with a real time.
+
+## GRUB fallback entry
+
+saq only maintains the files. A static `grub.cfg` that boots the aliases can add one more entry for the previous pair (same `root=`/options as the main entry):
+
+```
+menuentry "Faseela (previous kernel)" {
+    linux  /boot/vmlinuz.old root=UUID=... ro
+    initrd /boot/initramfs.img.old
+}
+```
 
 ## Choosing modules
 

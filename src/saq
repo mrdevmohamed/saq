@@ -11,7 +11,7 @@ set -Eeuo pipefail
 shopt -s nullglob
 
 readonly PROG="saq"
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SELF
@@ -29,6 +29,7 @@ ACTION=""
 KERNEL_VERSION=""
 DO_PRUNE=0
 UPDATE_DEFAULT=0
+KEEP_OLD=1
 DRY_RUN=0
 QUIET=0
 BOOT=""
@@ -50,7 +51,11 @@ Usage: saq [OPTIONS]
   --kernel VERSION       Build an image for one installed kernel.
   --prune                Remove images whose kernel is no longer installed.
   --update-default       Atomically point /boot/vmlinuz and /boot/initramfs.img
-                         at the newest kernel that has an image.
+                         at the newest kernel that has an image. The pair that
+                         was the default before is kept as /boot/vmlinuz.old
+                         and /boot/initramfs.img.old (real files, so they
+                         survive the package manager removing the old kernel).
+  --no-keep-old          With --update-default, do not keep those copies.
   --root DIR             Operate on another root filesystem (default: /).
   --dry-run              Print planned actions without changing anything.
   --quiet                Only print warnings and errors.
@@ -101,6 +106,10 @@ while (($#)); do
         ;;
     --update-default)
         UPDATE_DEFAULT=1
+        shift
+        ;;
+    --no-keep-old)
+        KEEP_OLD=0
         shift
         ;;
     --root)
@@ -323,9 +332,14 @@ build_one() {
     for applet in "${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}"; do
         if grep -qx "$applet" <<<"$BUSYBOX_APPLETS"; then ln -s busybox "$TREE/bin/$applet"; fi
     done
-    # Console nodes need root; without them the kernel opens /dev/console late.
-    mknod -m 600 "$TREE/dev/console" c 5 1 2>/dev/null || true
-    mknod -m 666 "$TREE/dev/null" c 1 3 2>/dev/null || true
+    # Console nodes need root (CAP_MKNOD). Without /dev/console in the image the
+    # kernel starts /init with no stdin/stdout/stderr, so nothing it prints and
+    # no rescue shell would be visible. /init reopens the console once devtmpfs
+    # is mounted, so this is no longer fatal, but it must not be silent.
+    mknod -m 600 "$TREE/dev/console" c 5 1 2>/dev/null ||
+        warn "cannot create /dev/console in the image (not root?); /init will open the console from devtmpfs"
+    mknod -m 666 "$TREE/dev/null" c 1 3 2>/dev/null ||
+        warn "cannot create /dev/null in the image (not root?)"
 
     # Read the dependency index (modules.dep lists the full closure per module).
     DEP_PATH=()
@@ -418,6 +432,47 @@ publish_default() {
     fi
 }
 
+# Copy SRC to $BOOT/NAME atomically (a reflink where the filesystem has them).
+store_copy() {
+    local src="$1" name="$2" tmp="$BOOT/.$2.keep.$$"
+    if cp --reflink=auto -f -- "$src" "$tmp" 2>/dev/null || cp -f -- "$src" "$tmp"; then
+        if mv -f -- "$tmp" "$BOOT/$name"; then return 0; fi
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# True when both files have the same content (coreutils only; no diffutils).
+same_file() {
+    [[ "$(sha256sum <"$1")" == "$(sha256sum <"$2")" ]]
+}
+
+# Keep the default pair that is being replaced, as real files that no package
+# owns. /boot/*.snap is a copy of the pair that was published last time; when a
+# different pair is published now, that copy becomes /boot/*.old and the new
+# pair is copied to *.snap. The copy is taken when a pair is published, because
+# by the time the next kernel package runs its hook the old files are gone.
+# Best effort: a full /boot only costs the fallback, never the new kernel.
+keep_previous() {
+    local ver="$1" k="$BOOT/vmlinuz-$1" i="$BOOT/initramfs-$1.img"
+    if [[ -f "$BOOT/vmlinuz.snap" && -f "$BOOT/initramfs.img.snap" ]]; then
+        if same_file "$BOOT/vmlinuz.snap" "$k" && same_file "$BOOT/initramfs.img.snap" "$i"; then
+            return 0 # this pair is already the snapshot: nothing was replaced
+        fi
+        if mv -f -- "$BOOT/vmlinuz.snap" "$BOOT/vmlinuz.old" &&
+            mv -f -- "$BOOT/initramfs.img.snap" "$BOOT/initramfs.img.old"; then
+            info "previous default kept as vmlinuz.old / initramfs.img.old"
+        else
+            warn "could not keep the previous default kernel as *.old"
+        fi
+    fi
+    if store_copy "$k" vmlinuz.snap && store_copy "$i" initramfs.img.snap; then
+        return 0
+    fi
+    rm -f -- "$BOOT/vmlinuz.snap" "$BOOT/initramfs.img.snap"
+    warn "could not copy kernel $ver to /boot/*.snap (is /boot full?); no fallback for the next update"
+}
+
 update_default() {
     local ver="" cand
     local -a versions=()
@@ -435,11 +490,13 @@ update_default() {
     fi
     if [[ "$DRY_RUN" == 1 ]]; then
         echo "would point $BOOT/vmlinuz and $BOOT/initramfs.img at version $ver"
+        if [[ "$KEEP_OLD" == 1 ]]; then echo "would keep the replaced default as vmlinuz.old / initramfs.img.old"; fi
         return 0
     fi
     publish_default vmlinuz "vmlinuz-$ver"
     publish_default initramfs.img "initramfs-$ver.img"
     info "default kernel is $ver"
+    if [[ "$KEEP_OLD" == 1 ]]; then keep_previous "$ver"; fi
 }
 
 prune_images() {
@@ -457,7 +514,7 @@ prune_images() {
     done
     # Leftovers of an interrupted run (the lock keeps live ones from racing us).
     if [[ "$DRY_RUN" != 1 ]]; then
-        for leftover in "$BOOT"/.initramfs-*.img.tmp.* "$BOOT"/.vmlinuz.new.* "$BOOT"/.initramfs.img.new.*; do
+        for leftover in "$BOOT"/.initramfs-*.img.tmp.* "$BOOT"/.vmlinuz.new.* "$BOOT"/.initramfs.img.new.* "$BOOT"/.*.keep.*; do
             rm -f -- "$leftover"
         done
     fi

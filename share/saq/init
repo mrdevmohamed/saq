@@ -38,6 +38,13 @@ if ! mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
     [ -e /dev/console ] || mknod /dev/console c 5 1
 fi
 
+# The kernel only gives /init stdin/stdout/stderr if /dev/console existed in
+# the initramfs when it started. Reopen the console now (devtmpfs has it), so
+# that every message below and the rescue shell reach the screen either way.
+if { : </dev/console >/dev/console; } 2>/dev/null; then
+    exec </dev/console >/dev/console 2>&1
+fi
+
 # ---- kernel command line ------------------------------------------------
 ROOT_SPEC=""
 ROOT_FSTYPE=""

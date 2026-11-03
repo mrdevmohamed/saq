@@ -97,6 +97,8 @@ done
 check "default kernel is the newest" test "$(readlink "$ROOT/boot/vmlinuz")" = "vmlinuz-6.2.0-test"
 check "default initramfs is the newest" test "$(readlink "$ROOT/boot/initramfs.img")" = "initramfs-6.2.0-test.img"
 check "missing firmware is reported" grep -q 'test/missing.bin' "$T/stderr"
+check "default pair is snapshotted as real files" test -f "$ROOT/boot/vmlinuz.snap" -a ! -L "$ROOT/boot/vmlinuz.snap" -a -s "$ROOT/boot/initramfs.img.snap"
+check "no .old pair on the first update" test ! -e "$ROOT/boot/vmlinuz.old"
 
 X="$T/extract"
 mkdir "$X"
@@ -104,6 +106,7 @@ mkdir "$X"
 M="$X/lib/modules/6.2.0-test/kernel"
 check "/init is executable" test -x "$X/init"
 check "/init matches the shipped script" cmp -s "$X/init" "$HERE/share/saq/init"
+check "/init reopens /dev/console after mounting devtmpfs" grep -q '^    exec </dev/console >/dev/console 2>&1' "$X/init"
 check "busybox is included" test -x "$X/bin/busybox"
 check "applet links exist" test "$(readlink "$X/bin/switch_root")" = busybox
 check "findfs applet is linked" test -L "$X/bin/findfs"
@@ -119,8 +122,9 @@ check "/etc/modules lists ext4" grep -qx ext4 "$X/etc/modules"
 check "builtin/absent modules are not listed" test "$(grep -c nvme "$X/etc/modules" || true)" = 0
 
 cp "$ROOT/boot/initramfs-6.2.0-test.img" "$T/first.img"
-run --kernel 6.2.0-test
+run --kernel 6.2.0-test --update-default
 check "builds are reproducible" cmp -s "$T/first.img" "$ROOT/boot/initramfs-6.2.0-test.img"
+check "an unchanged default does not rotate the snapshot" test ! -e "$ROOT/boot/vmlinuz.old"
 
 mkdir -p "$ROOT/etc/saq/modules.d"
 printf '# local override\n!ext4\n' >"$ROOT/etc/saq/modules.d/local.list"
@@ -145,7 +149,14 @@ run --all --update-default 2>/dev/null || rc=$?
 check "--all fails when one kernel cannot be built" test "$rc" != 0
 check "--all still builds the healthy kernel" test -s "$ROOT/boot/initramfs-6.3.0-test.img"
 check "--update-default skips kernels without an image" test "$(readlink "$ROOT/boot/vmlinuz")" = "vmlinuz-6.3.0-test"
+check "replaced default is kept as vmlinuz.old (its own files are gone)" test "$(cat "$ROOT/boot/vmlinuz.old")" = "fake kernel 6.2.0-test"
+check "replaced initramfs is kept as initramfs.img.old" gzip -t "$ROOT/boot/initramfs.img.old"
+check "snapshot now holds the new default" test "$(cat "$ROOT/boot/vmlinuz.snap")" = "fake kernel 6.3.0-test"
 
-check "no temporary files are left behind" test -z "$(find "$ROOT/boot" -name '.initramfs-*.tmp.*')"
+rm -f "$ROOT/boot/vmlinuz.old" "$ROOT/boot/initramfs.img.old" "$ROOT/boot/vmlinuz.snap" "$ROOT/boot/initramfs.img.snap"
+run --kernel 6.3.0-test --update-default --no-keep-old
+check "--no-keep-old keeps nothing" test -z "$(find "$ROOT/boot" -name '*.snap' -o -name '*.old')"
+
+check "no temporary files are left behind" test -z "$(find "$ROOT/boot" -name '.initramfs-*.tmp.*' -o -name '.*.keep.*')"
 
 echo "all $pass checks passed"
