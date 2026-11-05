@@ -282,6 +282,7 @@ stage_firmware() {
         for suffix in "" .xz .zst .gz; do
             # Expand the firmware glob directly. Hooks run inside Nawa's
             # chroot without /proc, so do not use Bash process substitution.
+            # shellcheck disable=SC2206 # Intentional pathname expansion; nullglob drops misses.
             matches=("$base"/$pattern$suffix)
             for match in "${matches[@]}"; do
                 [[ -f "$match" ]] || continue
