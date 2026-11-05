@@ -388,7 +388,7 @@ build_one() {
     while IFS= read -r -d '' path; do
         modfiles+=("$path")
     done <"$WORK/modfiles.list"
-    if (("${#modfiles[@]}")); then
+    if ((${#modfiles[@]})); then
         # Keep the module scan in ordinary files: /proc/self/fd is not
         # available to hooks running in Nawa's minimal chroot.
         (modinfo -F firmware "${modfiles[@]}" 2>/dev/null || true) |
