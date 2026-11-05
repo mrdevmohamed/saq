@@ -271,7 +271,8 @@ stage_module_file() {
 # Copy firmware matching a modinfo "firmware:" entry (may contain globs, may be
 # stored compressed) into the image, always uncompressed.
 stage_firmware() {
-    local pattern="$1" base suffix rel out dest found=0
+    local pattern="$1" base suffix rel out dest match found=0
+    local -a matches=()
     if [[ "$pattern" == /* || "/$pattern/" == *"/../"* ]]; then
         warn "ignoring unsafe firmware path: $pattern"
         return 0
@@ -279,15 +280,21 @@ stage_firmware() {
     for base in "$ROOT/usr/lib/firmware" "$ROOT/lib/firmware"; do
         [[ -d "$base" ]] || continue
         for suffix in "" .xz .zst .gz; do
-            while IFS= read -r rel; do
-                [[ -n "$rel" && -f "$base/$rel" ]] || continue
+            # Expand the firmware glob directly. Hooks run inside Nawa's
+            # chroot without /proc, so do not use Bash process substitution.
+            # shellcheck disable=SC2206 # Intentional pathname expansion; nullglob drops misses.
+            matches=("$base"/$pattern$suffix)
+            for match in "${matches[@]}"; do
+                [[ -f "$match" ]] || continue
+                rel="${match#"$base"/}"
+                [[ -n "$rel" ]] || continue
                 out="${rel%"$suffix"}"
                 dest="$TREE/lib/firmware/$out"
                 found=1
                 [[ ! -e "$dest" ]] || continue
                 mkdir -p -- "${dest%/*}"
-                decompress "$base/$rel" >"$dest"
-            done < <(cd "$base" && { compgen -G "$pattern$suffix" || true; })
+                decompress "$match" >"$dest"
+            done
         done
         if [[ "$found" == 1 ]]; then break; fi
     done
@@ -378,12 +385,18 @@ build_one() {
     depmod -b "$TREE" "$ver" || die "depmod failed for the staged modules of $ver"
     [[ -f "$MODULES_TREE/modules.dep" ]] || die "depmod produced no modules.dep for $ver"
 
-    while IFS= read -r -d '' path; do modfiles+=("$path"); done \
-        < <(find "$MODULES_TREE" -type f -name '*.ko' -print0)
+    find "$MODULES_TREE" -type f -name '*.ko' -print0 >"$WORK/modfiles.list"
+    while IFS= read -r -d '' path; do
+        modfiles+=("$path")
+    done <"$WORK/modfiles.list"
     if ((${#modfiles[@]})); then
+        # Keep the module scan in ordinary files: /proc/self/fd is not
+        # available to hooks running in Nawa's minimal chroot.
+        (modinfo -F firmware "${modfiles[@]}" 2>/dev/null || true) |
+            sort -u >"$WORK/firmware.list"
         while IFS= read -r fw; do
             [[ -z "$fw" ]] || stage_firmware "$fw"
-        done < <(modinfo -F firmware "${modfiles[@]}" 2>/dev/null | sort -u || true)
+        done <"$WORK/firmware.list"
     else
         info "no loadable storage modules for $ver (everything built in?)"
     fi
@@ -474,9 +487,14 @@ keep_previous() {
 }
 
 update_default() {
-    local ver="" cand
+    local ver="" cand version_list=""
     local -a versions=()
-    mapfile -t versions < <(installed_versions | sort -Vr)
+    # Nawa deliberately does not mount /proc in its chroot hooks. Use a
+    # here-string instead of process substitution for this short version list.
+    version_list="$(installed_versions | sort -Vr)"
+    if [[ -n "$version_list" ]]; then
+        mapfile -t versions <<<"$version_list"
+    fi
     for cand in "${versions[@]}"; do
         # A dry run builds nothing, so judge by the kernels alone.
         if [[ -s "$BOOT/initramfs-$cand.img" || "$DRY_RUN" == 1 ]]; then
@@ -530,7 +548,11 @@ fi
 status=0
 case "$ACTION" in
 all)
-    mapfile -t ALL_VERSIONS < <(installed_versions | sort -V)
+    version_list="$(installed_versions | sort -V)"
+    ALL_VERSIONS=()
+    if [[ -n "$version_list" ]]; then
+        mapfile -t ALL_VERSIONS <<<"$version_list"
+    fi
     ((${#ALL_VERSIONS[@]})) || die "no $BOOT/vmlinuz-* kernels found"
     passthru=()
     [[ "$DRY_RUN" != 1 ]] || passthru+=(--dry-run)
