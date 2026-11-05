@@ -36,6 +36,10 @@ check() { # check "description" command...
 }
 run() { "$GEN" --root "$ROOT" --quiet "$@"; }
 
+no_process_substitution() {
+    ! grep -Fq '<(' "$GEN"
+}
+
 # ---- fake root ------------------------------------------------------------
 make_module() { # make_module NAME FIRMWARE...
     local name="$1" info="license=GPL" fw
@@ -77,6 +81,7 @@ make_kernel 6.2.0-test
 busybox sh -n "$HERE/share/saq/init" && ok "init script parses with BusyBox ash"
 check "--help works" "$GEN" --help
 check "--version works" "$GEN" --version
+check "no /proc-backed process substitution in chroot hooks" no_process_substitution
 rc=0
 "$GEN" --bogus >/dev/null 2>&1 || rc=$?
 check "unknown option exits 2" test "$rc" = 2
