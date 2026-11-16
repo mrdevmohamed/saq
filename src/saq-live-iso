@@ -101,7 +101,7 @@ for tool in mksquashfs grub-mkrescue xorriso; do
 done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/saq-live-iso.XXXXXX")"
-# shellcheck disable=SC2317 # runs from the EXIT trap
+# shellcheck disable=SC2317,SC2329 # runs from the EXIT trap
 cleanup() { rm -rf -- "$WORK"; }
 trap cleanup EXIT
 

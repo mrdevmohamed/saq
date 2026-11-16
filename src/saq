@@ -82,7 +82,7 @@ byte-identical images.
 USAGE
 }
 
-# shellcheck disable=SC2317 # runs from the EXIT trap
+# shellcheck disable=SC2317,SC2329 # runs from the EXIT trap
 cleanup() {
     if [[ -n "$TMPOUT" ]]; then rm -f -- "$TMPOUT"; fi
     if [[ -n "$WORK" ]]; then rm -rf -- "$WORK"; fi
