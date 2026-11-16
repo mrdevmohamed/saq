@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# saq-live-iso - turn any root filesystem into a live ISO.
+#
+#   saq-live-iso [OPTIONS] ROOTFS OUT.iso
+#
+# ROOTFS is a directory, or a tarball (.tar .tar.gz .tar.xz .tar.zst .tar.bz2),
+# holding a complete root: /usr, /etc, a kernel and its modules (/boot and
+# /lib/modules, or /usr/lib/modules).
+#
+# The ISO boots from a CD, a dd-written USB stick, or as a *file* from a Ventoy
+# stick (copy it there and pick it in the menu), on BIOS and UEFI. Booting gives
+# a live session with a passwordless "live" user (and root without password) so
+# the system can be tried without installing; see `saq --help` and share/saq/init-live.
+#
+# A directory is only read, never changed. Needs root only to keep file ownership
+# when extracting a tarball. Host tools: mksquashfs (squashfs-tools), grub-mkrescue,
+# xorriso, mtools, and for the initramfs what saq needs (cpio, gzip, depmod, a
+# static busybox in the root or on the host).
+#
+# Options:
+#   --kernel-version V   kernel to use (default: the newest in lib/modules)
+#   --kernel FILE        kernel image (default: looked up in the root's /boot)
+#   --init PATH          init to start in the live root (default: runit, /sbin/init,
+#                        /usr/lib/systemd/systemd, whichever exists)
+#   --busybox FILE       static busybox for the initramfs (default: the root's, else the host's)
+#   --vol-id NAME        ISO volume id (default LIVE)
+#   --compression C      xz (default), zstd or gzip
+#   --serial             also send the kernel console to ttyS0 (QEMU, servers)
+#   --kernel-args "..."  extra kernel command line arguments
+#   -h, --help
+set -Eeuo pipefail
+
+readonly PROG="saq-live-iso"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SELF
+SAQ="${SAQ_BIN:-}"
+if [[ -z "$SAQ" ]]; then
+    if [[ -x "${SELF%/*}/saq" ]]; then SAQ="${SELF%/*}/saq"; else SAQ="saq"; fi
+fi
+
+die() {
+    echo "$PROG: $*" >&2
+    exit 1
+}
+info() { echo "== $PROG: $*"; }
+usage() { sed -n '2,/^set -Eeuo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+ROOTFS="" OUT="" KVER="" KERNEL_FILE="" INIT="" BUSYBOX_FILE=""
+VOL_ID="LIVE" COMP="xz" SERIAL=0 EXTRA_ARGS=""
+while (($#)); do
+    case "$1" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    --kernel-version | --kernel | --init | --busybox | --vol-id | --compression | --kernel-args)
+        [[ $# -ge 2 ]] || die "$1 needs a value"
+        case "$1" in
+        --kernel-version) KVER="$2" ;;
+        --kernel) KERNEL_FILE="$2" ;;
+        --init) INIT="$2" ;;
+        --busybox) BUSYBOX_FILE="$2" ;;
+        --vol-id) VOL_ID="$2" ;;
+        --compression) COMP="$2" ;;
+        --kernel-args) EXTRA_ARGS="$2" ;;
+        esac
+        shift 2
+        ;;
+    --serial)
+        SERIAL=1
+        shift
+        ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *)
+        if [[ -z "$ROOTFS" ]]; then
+            ROOTFS="$1"
+        elif [[ -z "$OUT" ]]; then
+            OUT="$1"
+        else
+            die "unexpected argument $1"
+        fi
+        shift
+        ;;
+    esac
+done
+[[ -n "$ROOTFS" && -n "$OUT" ]] || {
+    usage >&2
+    exit 2
+}
+[[ -z "$INIT" || "$INIT" == /* ]] || die "--init must be an absolute path inside the root (got '$INIT')"
+[[ -z "$KERNEL_FILE" || -f "$KERNEL_FILE" ]] || die "kernel file not found: $KERNEL_FILE"
+[[ "$VOL_ID" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "--vol-id: letters, digits, _ . - only (max 32)"
+case "$COMP" in
+xz) COMP_OPTS=(-b 1M -Xdict-size 100% -Xbcj x86) ;;
+zstd) COMP_OPTS=(-b 1M -Xcompression-level 19) ;;
+gzip) COMP_OPTS=() ;;
+*) die "--compression must be xz, zstd or gzip (got '$COMP')" ;;
+esac
+for tool in mksquashfs grub-mkrescue xorriso; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing host tool '$tool' (Debian: apt install squashfs-tools grub-pc-bin grub-efi-amd64-bin xorriso mtools)"
+done
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/saq-live-iso.XXXXXX")"
+# shellcheck disable=SC2317,SC2329 # runs from the EXIT trap
+cleanup() { rm -rf -- "$WORK"; }
+trap cleanup EXIT
+
+# ---- the root -------------------------------------------------------------------
+EXTRACTED=0
+if [[ -d "$ROOTFS" ]]; then
+    ROOT="$(cd "$ROOTFS" && pwd -P)"
+elif [[ -f "$ROOTFS" ]]; then
+    case "$ROOTFS" in
+    *.tar) DEC=() ;;
+    *.tar.gz | *.tgz) DEC=(-z) ;;
+    *.tar.xz | *.txz) DEC=(-J) ;;
+    *.tar.bz2 | *.tbz2) DEC=(-j) ;;
+    *.tar.zst | *.tzst) DEC=(--zstd) ;;
+    *) die "unknown archive type: $ROOTFS" ;;
+    esac
+    [[ "$EUID" -eq 0 ]] || die "extracting a tarball needs root (to keep file ownership); run with sudo or pass a directory"
+    ROOT="$WORK/root"
+    mkdir -p "$ROOT"
+    info "extracting $ROOTFS"
+    tar -xpf "$ROOTFS" "${DEC[@]}" --numeric-owner --xattrs -C "$ROOT"
+    # a tarball with one top-level directory holds the root inside it
+    if [[ ! -d "$ROOT/usr" && ! -d "$ROOT/etc" ]]; then
+        mapfile -t top < <(find "$ROOT" -mindepth 1 -maxdepth 1)
+        if [[ ${#top[@]} -eq 1 && -d "${top[0]}/usr" ]]; then ROOT="${top[0]}"; fi
+    fi
+    EXTRACTED=1
+else
+    die "$ROOTFS is neither a directory nor a file"
+fi
+[[ -d "$ROOT/usr" || -d "$ROOT/etc" ]] || die "$ROOTFS does not look like a root filesystem (no /usr, no /etc)"
+for f in etc/passwd etc/group; do [[ -f "$ROOT/$f" ]] || die "the root has no /$f (the live user cannot be created)"; done
+for p in proc sys dev run; do
+    if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$ROOT/$p"; then
+        die "$ROOT/$p is a mount point; the squashfs would bake in the host's pseudo-filesystem (umount it first)"
+    fi
+done
+
+# ---- kernel ---------------------------------------------------------------------
+if [[ -z "$KVER" ]]; then
+    for d in "$ROOT/lib/modules" "$ROOT/usr/lib/modules"; do
+        [[ -d "$d" ]] || continue
+        KVER="$(find "$d" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n 1)"
+        [[ -z "$KVER" ]] || break
+    done
+fi
+[[ -n "$KVER" ]] || die "no kernel modules in the root (/lib/modules is empty); pass --kernel-version if the kernel has everything built in"
+if [[ -z "$KERNEL_FILE" ]]; then
+    for c in "$ROOT/boot/vmlinuz-$KVER" "$ROOT/usr/lib/modules/$KVER/vmlinuz" "$ROOT/lib/modules/$KVER/vmlinuz" \
+        "$ROOT/boot/vmlinuz-linux" "$ROOT/boot/vmlinuz" "$ROOT/boot/bzImage" "$ROOT/vmlinuz"; do
+        if [[ -f "$c" ]]; then
+            KERNEL_FILE="$c"
+            break
+        fi
+    done
+fi
+[[ -n "$KERNEL_FILE" ]] || die "no kernel image for $KVER in $ROOT/boot; pass --kernel FILE"
+KDIR="$ROOT/lib/modules/$KVER"
+[[ -d "$KDIR" ]] || KDIR="$ROOT/usr/lib/modules/$KVER"
+if [[ -d "$KDIR" && ! -s "$KDIR/modules.dep" ]]; then
+    [[ "$EXTRACTED" == 1 ]] || die "no modules.dep in $KDIR; run: depmod -b $ROOT $KVER (a directory is never modified)"
+    depmod -b "$ROOT" "$KVER"
+fi
+info "kernel $KVER ($KERNEL_FILE)"
+
+# ---- initramfs --------------------------------------------------------------------
+ISO="$WORK/iso"
+mkdir -p "$ISO/boot/grub" "$ISO/live"
+saq_args=(--live --root "$ROOT" --kernel "$KVER" --output "$ISO/boot/initramfs.img" --quiet)
+[[ -z "$BUSYBOX_FILE" ]] || saq_args+=(--busybox "$BUSYBOX_FILE")
+info "building the live initramfs"
+"$SAQ" "${saq_args[@]}"
+cp -- "$KERNEL_FILE" "$ISO/boot/vmlinuz"
+
+# ---- squashfs ---------------------------------------------------------------------
+info "mksquashfs of $ROOT ($COMP)"
+mksquashfs "$ROOT" "$ISO/live/rootfs.squashfs" -comp "$COMP" "${COMP_OPTS[@]}" \
+    -noappend -no-recovery -quiet
+
+# ---- GRUB: BIOS + UEFI, plus loopback.cfg for ISO-as-a-file -------------------------
+CONSOLE="console=tty0"
+[[ "$SERIAL" != 1 ]] || CONSOLE="console=ttyS0,115200 console=tty0"
+INITARG=""
+[[ -z "$INIT" ]] || INITARG="init=$INIT "
+EXTRA=""
+[[ -z "$EXTRA_ARGS" ]] || EXTRA="$EXTRA_ARGS "
+
+# Entries shared by grub.cfg (boot from the medium) and loopback.cfg (the ISO is a file:
+# GRUB's loopback, Ventoy's GRUB2 mode). $isoparam is empty on a normal boot and
+# iso-scan/filename=<path> when the ISO is a file; the initramfs also scans by itself.
+menu_entries() {
+    cat <<ENTRIES
+set default=0
+set timeout=5
+
+menuentry "Live system" {
+    linux /boot/vmlinuz quiet ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    initrd /boot/initramfs.img
+}
+
+menuentry "Live system (without persistence)" {
+    linux /boot/vmlinuz quiet nopersist ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    initrd /boot/initramfs.img
+}
+
+menuentry "Live system (verbose)" {
+    linux /boot/vmlinuz loglevel=7 ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    initrd /boot/initramfs.img
+}
+ENTRIES
+}
+# the same snippet starts both files: Ventoy (GRUB2 mode) and a loopback caller set (and
+# must `export`) iso_path; without it $isoparam stays empty and the initramfs scans for the ISO
+isoparam_snippet() {
+    cat <<'ISOPARAM'
+set isoparam=""
+if [ -n "${iso_path}" ]; then
+    set isoparam="iso-scan/filename=${iso_path}"
+fi
+
+ISOPARAM
+}
+{
+    echo '# boot menu of the live ISO'
+    isoparam_snippet
+    menu_entries
+} >"$ISO/boot/grub/grub.cfg"
+{
+    echo '# boot this ISO from a file (GRUB loopback); the caller sets AND exports iso_path'
+    isoparam_snippet
+    menu_entries
+} >"$ISO/boot/grub/loopback.cfg"
+
+info "grub-mkrescue"
+mkdir -p "$(dirname -- "$OUT")"
+grub-mkrescue -o "$OUT" "$ISO" -volid "$VOL_ID" >"$WORK/grub.log" 2>&1 || {
+    cat "$WORK/grub.log" >&2
+    die "grub-mkrescue failed (is mtools installed?)"
+}
+
+# ---- structural check: a listing that lacks a boot-critical file is not shipped ----------
+for member in /boot/vmlinuz /boot/initramfs.img /boot/grub/grub.cfg /boot/grub/loopback.cfg /live/rootfs.squashfs; do
+    if ! xorriso -indev "$OUT" -ls "$(dirname -- "$member")" 2>/dev/null | grep -q -- "$(basename -- "$member")"; then
+        rm -f -- "$OUT"
+        die "ISO validation failed: $member is not in the image; not shipping it"
+    fi
+done
+info "done: $OUT ($(du -h -- "$OUT" | cut -f1)); copy it to a Ventoy stick or write it with dd. Log in as 'live' (no password)."

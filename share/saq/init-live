@@ -1,0 +1,268 @@
+#!/bin/busybox sh
+# /init of the saq LIVE initramfs (saq --live, saq-live-iso).
+#
+# Runs with BusyBox ash only. It finds the live medium, mounts its squashfs
+# read-only, puts a writable overlay on top, creates the passwordless "live"
+# user and hands over to the root's init with switch_root.
+#
+# The medium is found two ways, tried in turn until one works:
+#   1. a block device that IS the ISO: a CD, a dd-written stick, or the
+#      device-mapper device Ventoy builds over the ISO file
+#   2. an ISO FILE on some partition (Ventoy's exFAT/NTFS data partition, or any
+#      disk booted through GRUB's loopback): partitions are mounted read-only,
+#      the ISO is loop-mounted
+# Either way the medium is the filesystem holding /live/rootfs.squashfs.
+#
+# Kernel command line understood:
+#   iso-scan/filename=/PATH.iso | findiso=/PATH.iso   the ISO file (optional)
+#   init=PATH        init to start (default: runit, /sbin/init, systemd, ...)
+#   rootdelay=N      wait at most N seconds for the medium (default 30)
+#   nopersist        ignore a persistence partition
+#   nolive           no live user, no empty root password
+#   break[=STAGE]    shell before (premount, default) / after (postmount) the overlay
+#   quiet            suppress progress messages
+# Persistence: an ext4 partition labelled LIVE_PERSIST (or FASEELA_PERSIST)
+# keeps the overlay's upper layer, so changes survive a reboot.
+
+PATH=/bin
+export PATH
+
+QUIET=0
+say() { [ "$QUIET" = 1 ] || echo "saq: $*"; }
+err() { echo "saq: $*" >&2; }
+rescue() {
+    err "$*"
+    err "dropping to a rescue shell; 'exit' will panic the kernel"
+    exec sh
+}
+
+mkdir -p /dev /proc /sys /run /newroot /cdrom /iso-host /ro /rw
+
+mount -t proc proc /proc || rescue "cannot mount /proc"
+mount -t sysfs sysfs /sys || rescue "cannot mount /sys"
+if ! mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
+    [ -e /dev/console ] || mknod /dev/console c 5 1
+fi
+if { : </dev/console >/dev/console; } 2>/dev/null; then
+    exec </dev/console >/dev/console 2>&1
+fi
+
+# ---- kernel command line ------------------------------------------------
+INIT_ARG=""
+ISO_HINT=""
+WAIT_LIMIT=30
+NOPERSIST=0
+NOLIVE=0
+BREAK=""
+
+set -f # a '*' on the command line must not be glob-expanded below
+# shellcheck disable=SC2013 # splitting into words is exactly what we want
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+    init=/*) INIT_ARG="${arg#init=}" ;;
+    iso-scan/filename=*) ISO_HINT="${arg#iso-scan/filename=}" ;;
+    findiso=*) ISO_HINT="${arg#findiso=}" ;;
+    rootdelay=*) WAIT_LIMIT="${arg#rootdelay=}" ;;
+    nopersist) NOPERSIST=1 ;;
+    nolive) NOLIVE=1 ;;
+    break) BREAK="premount" ;;
+    break=*) BREAK="${arg#break=}" ;;
+    quiet) QUIET=1 ;;
+    esac
+done
+set +f
+
+case "$WAIT_LIMIT" in
+'' | *[!0-9]*) WAIT_LIMIT=30 ;;
+esac
+
+maybe_break() {
+    [ "$BREAK" = "$1" ] || return 0
+    say "break=$1: opening a shell, 'exit' to continue booting"
+    sh
+}
+
+# ---- storage modules ----------------------------------------------------
+if [ -r /etc/modules ]; then
+    say "loading storage modules"
+    while read -r module; do
+        case "$module" in
+        '' | '#'*) continue ;;
+        esac
+        modprobe -q "$module" 2>/dev/null || true
+    done </etc/modules
+fi
+
+maybe_break premount
+
+# ---- find the live medium -----------------------------------------------
+SQUASH=/cdrom/live/rootfs.squashfs
+FOUND=""
+
+# try_iso FILE: loop-mount an ISO image at /cdrom; success only if it holds the live image
+try_iso() {
+    mount -t iso9660 -o ro,loop "$1" /cdrom 2>/dev/null || return 1
+    [ -f "$SQUASH" ] && return 0
+    umount /cdrom 2>/dev/null
+    return 1
+}
+
+# scan_iso_files DEV: look for the ISO on one partition. On success the partition stays
+# mounted at /iso-host (the loop device lives on it) and $FOUND names the file.
+scan_iso_files() {
+    mount -o ro "$1" /iso-host 2>/dev/null || return 1
+    if [ -n "$ISO_HINT" ] && [ -f "/iso-host$ISO_HINT" ] && try_iso "/iso-host$ISO_HINT"; then
+        FOUND="$1:$ISO_HINT"
+        return 0
+    fi
+    # *.iso up to three directories deep, the ones that look like ours first
+    for f in /iso-host/*[Ll]ive*.iso /iso-host/*/*[Ll]ive*.iso /iso-host/*/*/*[Ll]ive*.iso \
+        /iso-host/*.iso /iso-host/*/*.iso /iso-host/*/*/*.iso; do
+        [ -f "$f" ] || continue
+        if try_iso "$f"; then
+            FOUND="$1:${f#/iso-host}"
+            return 0
+        fi
+    done
+    umount /iso-host 2>/dev/null
+    return 1
+}
+
+say "waiting for the live medium"
+tries=0
+while [ -z "$FOUND" ]; do
+    for dev in /dev/sr[0-9]* /dev/sd[a-z] /dev/sd[a-z]*[0-9] /dev/vd[a-z] /dev/vd[a-z]*[0-9] \
+        /dev/nvme*n*p[0-9] /dev/nvme*n[0-9] /dev/mmcblk*p[0-9] /dev/mapper/* /dev/dm-[0-9]*; do
+        [ -b "$dev" ] || continue
+        for fs in iso9660 ""; do
+            if [ -n "$fs" ]; then
+                mount -t "$fs" -o ro "$dev" /cdrom 2>/dev/null || continue
+            else
+                mount -o ro "$dev" /cdrom 2>/dev/null || continue
+            fi
+            if [ -f "$SQUASH" ]; then
+                FOUND="$dev"
+                break 3
+            fi
+            umount /cdrom 2>/dev/null
+        done
+    done
+    for dev in /dev/sd[a-z]*[0-9] /dev/sd[a-z] /dev/vd[a-z]*[0-9] /dev/vd[a-z] \
+        /dev/nvme*n*p[0-9] /dev/mmcblk*p[0-9]; do
+        [ -b "$dev" ] || continue
+        scan_iso_files "$dev" && break 2
+    done
+    tries=$((tries + 1))
+    [ "$tries" -lt "$WAIT_LIMIT" ] || break
+    sleep 1
+done
+
+if [ -z "$FOUND" ]; then
+    err "no live medium with /live/rootfs.squashfs found"
+    err "block devices the kernel knows about:"
+    cat /proc/partitions >&2
+    rescue "live medium not available"
+fi
+say "live medium: $FOUND"
+
+mount -t squashfs -o ro "$SQUASH" /ro || rescue "cannot mount $SQUASH"
+
+# ---- writable layer -------------------------------------------------------
+PERSIST=""
+if [ "$NOPERSIST" != 1 ]; then
+    PERSIST="$(findfs LABEL=LIVE_PERSIST 2>/dev/null || findfs LABEL=FASEELA_PERSIST 2>/dev/null || true)"
+fi
+if [ -n "$PERSIST" ] && mount -t ext4 -o noatime "$PERSIST" /rw 2>/dev/null; then
+    say "persistence on $PERSIST"
+else
+    [ -z "$PERSIST" ] || err "cannot mount $PERSIST - changes will not be kept"
+    mount -t tmpfs tmpfs /rw || rescue "cannot mount a tmpfs for the overlay"
+fi
+mkdir -p /rw/upper /rw/work
+mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /newroot ||
+    rescue "overlayfs mount failed"
+
+# >>> live-user
+# The live session's accounts. Everything lands in the overlay: the squashfs is
+# untouched, and with persistence the steps below simply run again (idempotent).
+# root gets an empty password too (most roots ship it locked, which makes login
+# impossible). The user is in the groups that exist on this root and needs no
+# password for doas or sudo, whichever the root has.
+make_live_user() { # make_live_user ROOTDIR
+    r="$1"
+    if [ -f "$r/etc/shadow" ]; then sed -i 's/^root:[^:]*:/root::/' "$r/etc/shadow"; fi
+    if ! grep -q '^live:' "$r/etc/passwd" 2>/dev/null; then
+        uid=1000
+        while grep -q "^[^:]*:[^:]*:$uid:" "$r/etc/passwd"; do uid=$((uid + 1)); done
+        gid=$uid
+        while grep -q "^[^:]*:[^:]*:$gid:" "$r/etc/group"; do gid=$((gid + 1)); done
+        sh_="/bin/sh"
+        if [ -x "$r/bin/bash" ] || [ -x "$r/usr/bin/bash" ]; then sh_="/bin/bash"; fi
+        echo "live:x:$uid:$gid:Live session:/home/live:$sh_" >>"$r/etc/passwd"
+        grep -q '^live:' "$r/etc/group" || echo "live:x:$gid:" >>"$r/etc/group"
+    fi
+    if grep -q '^live:' "$r/etc/shadow" 2>/dev/null; then
+        sed -i 's/^live:[^:]*:/live::/' "$r/etc/shadow"
+    else
+        echo 'live::19980:0:99999:7:::' >>"$r/etc/shadow"
+    fi
+    for g in wheel sudo seat video render input audio cdrom plugdev netdev dialout; do
+        grep -q "^$g:" "$r/etc/group" || continue
+        if grep -q "^$g:[^:]*:[^:]*:\(.*,\)\{0,1\}live\(,.*\)\{0,1\}$" "$r/etc/group"; then continue; fi
+        sed -i "/^$g:/{s/:\$/:live/;t;s/\$/,live/}" "$r/etc/group"
+    done
+    if [ ! -d "$r/home/live" ]; then
+        uid="$(sed -n 's/^live:[^:]*:\([0-9]*\):\([0-9]*\):.*/\1/p' "$r/etc/passwd")"
+        gid="$(sed -n 's/^live:[^:]*:\([0-9]*\):\([0-9]*\):.*/\2/p' "$r/etc/passwd")"
+        mkdir -p "$r/home/live"
+        if [ -d "$r/etc/skel" ]; then cp -a "$r/etc/skel/." "$r/home/live/" 2>/dev/null; fi
+        chown -R "$uid:$gid" "$r/home/live"
+        chmod 755 "$r/home/live"
+    fi
+    if [ -f "$r/etc/doas.conf" ] && ! grep -q '^permit nopass live$' "$r/etc/doas.conf"; then
+        echo 'permit nopass live' >>"$r/etc/doas.conf"
+    fi
+    if [ -d "$r/etc/sudoers.d" ]; then
+        echo 'live ALL=(ALL) NOPASSWD: ALL' >"$r/etc/sudoers.d/90-saq-live"
+        chmod 440 "$r/etc/sudoers.d/90-saq-live"
+    fi
+    echo live >"$r/etc/saq-live"
+    if ! grep -q 'Live session: log in as' "$r/etc/issue" 2>/dev/null; then
+        printf '\nLive session: log in as "live" (no password).\n\n' >>"$r/etc/issue"
+    fi
+}
+# <<< live-user
+if [ "$NOLIVE" = 1 ]; then
+    say "nolive: no live user, accounts left as they are"
+else
+    make_live_user /newroot
+    say "live session: user 'live' and root have empty passwords"
+fi
+
+maybe_break postmount
+
+# ---- hand over ----------------------------------------------------------
+NEW_INIT=""
+for candidate in "$INIT_ARG" /usr/bin/runit /sbin/init /usr/sbin/init /usr/lib/systemd/systemd; do
+    [ -n "$candidate" ] || continue
+    if [ -x "/newroot$candidate" ]; then
+        NEW_INIT="$candidate"
+        break
+    fi
+done
+[ -n "$NEW_INIT" ] || rescue "no init found in the live root (tried ${INIT_ARG:+$INIT_ARG }/usr/bin/runit /sbin/init /usr/sbin/init /usr/lib/systemd/systemd)"
+
+mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run /newroot/cdrom 2>/dev/null || true
+mount -o move /dev /newroot/dev || rescue "cannot move /dev"
+mount -o move /proc /newroot/proc || rescue "cannot move /proc"
+mount -o move /sys /newroot/sys || rescue "cannot move /sys"
+# the medium stays visible at /cdrom (an installer reads the kernel from it)
+mount -o move /cdrom /newroot/cdrom 2>/dev/null || true
+# an ISO booted as a file (Ventoy): its partition backs the loop device, keep it mounted
+if grep -q " /iso-host " /newroot/proc/mounts; then
+    mkdir -p /newroot/media/iso-host 2>/dev/null || true
+    mount -o move /iso-host /newroot/media/iso-host 2>/dev/null || true
+fi
+
+say "switching to $NEW_INIT"
+exec switch_root -c /dev/console /newroot "$NEW_INIT"
