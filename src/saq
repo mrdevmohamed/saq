@@ -404,7 +404,10 @@ build_one() {
     if [[ "$LIVE" == 1 ]]; then mkdir -p "$TREE"/{cdrom,iso-host,ro,rw}; fi
 
     cp -- "$BUSYBOX" "$TREE/bin/busybox"
-    for applet in "${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}" "${LIVE_APPLETS[@]}"; do
+    local -a link_applets=("${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}")
+    # the live init's extra applets: not in the images of installed systems
+    if [[ "$LIVE" == 1 ]]; then link_applets+=("${LIVE_APPLETS[@]}"); fi
+    for applet in "${link_applets[@]}"; do
         [[ ! -e "$TREE/bin/$applet" ]] || continue
         if grep -qx "$applet" <<<"$BUSYBOX_APPLETS"; then ln -s busybox "$TREE/bin/$applet"; fi
     done

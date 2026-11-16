@@ -98,6 +98,18 @@ check "live applets are linked (chown, chmod, grep, sed, cp)" bash -c "for a in 
 check "isofs is staged and listed" bash -c "grep -qx isofs '$X/etc/modules'"
 check "exfat (Ventoy's default) is staged and listed" bash -c "grep -qx exfat '$X/etc/modules'"
 
+# the images of installed systems are not affected by any of this
+mkdir -p "$ROOT/boot"
+echo k >"$ROOT/boot/vmlinuz-6.9.0-live"
+"$SAQ" --root "$ROOT" --kernel 6.9.0-live --quiet
+rm -rf "$X"
+mkdir "$X"
+(cd "$X" && gzip -dc "$ROOT/boot/initramfs-6.9.0-live.img" | cpio -idm --quiet)
+check "a normal image keeps the installed-system init" cmp -s "$X/init" "$HERE/share/saq/init"
+check "a normal image has no live applets or mount points" bash -c "test ! -e '$X/bin/chown' -a ! -d '$X/iso-host' -a ! -e '$X/bin/chmod'"
+check "a normal image does not list live-only modules" bash -c "! grep -qx isofs '$X/etc/modules'"
+rm -rf "$ROOT/boot"
+
 # ---- saq-live-iso ----------------------------------------------------------------------
 bash -n "$ISO_TOOL" && ok "saq-live-iso parses"
 check "--help works" "$ISO_TOOL" --help

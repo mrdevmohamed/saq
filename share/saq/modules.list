@@ -22,7 +22,7 @@ xhci_pci xhci_hcd ehci_pci ehci_hcd ohci_pci ohci_hcd uhci_hcd
 mmc_core mmc_block sdhci sdhci_pci sdhci_acpi
 
 # filesystems
-isofs iso9660 udf squashfs overlay loop
+iso9660 udf squashfs overlay loop
 ext4 btrfs xfs f2fs ntfs3 fat vfat
 nls_cp437 nls_iso8859_1 nls_utf8
 

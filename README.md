@@ -1,13 +1,13 @@
 # saq
 
-Initramfs tool for the [Faseela](https://github.com/mrdevmohamed/faseela) distro.
+Initramfs tool for the [Faseela](https://github.com/mrdevmohamed/faseela) distro, or any Linux distro.
 
 `saq` builds `/boot/initramfs-VERSION.img` for every kernel
 installed in `/boot`: a static BusyBox, the storage and filesystem modules from
 `modules.list` (with their dependencies and firmware) and a small `/init` that
-mounts the root filesystem and hands over to runit. With `--live` it builds the
-initramfs of a live system instead, and `saq-live-iso` turns any root filesystem
-into a bootable live ISO (see below).
+mounts the root filesystem and hands over to runit. That is what saq is, and
+none of it changed. Next to it, the `saq-live-iso` script turns any root filesystem
+into a bootable live ISO (see below); it uses `saq --live` for the live initramfs.
 
 The code started as faseela-repo PR #44 and lives here so it can be versioned,
 tested and packaged on its own.
