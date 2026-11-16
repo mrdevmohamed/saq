@@ -86,6 +86,8 @@ Checked in QEMU (BIOS GRUB from a CD, an ISO file on a FAT partition with and wi
 exFAT/NTFS data partitions, a real Ventoy stick. Ventoy's own boot modes are not
 under our control: use its normal or GRUB2 mode and report what happens.
 
+Worked examples for Ubuntu/Debian, Arch, Fedora, Alpine, Void and container images: [docs/live-iso-examples.md](docs/live-iso-examples.md).
+
 `saq --live --kernel VERSION --output FILE [--root DIR] [--busybox FILE]` builds just the
 initramfs, never touching the root.
 
