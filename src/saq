@@ -4,14 +4,14 @@
 # For every /boot/vmlinuz-VERSION it writes /boot/initramfs-VERSION.img holding
 # a static BusyBox, the storage/filesystem modules named in modules.list (plus
 # their dependencies and firmware) and the /init script from the data directory.
-# The live ISO has its own initramfs; this tool is for installed systems.
+# With --live it builds the initramfs of a live ISO instead (see saq-live-iso).
 #
 # The generator itself never installs hooks: the kernel package calls it.
 set -Eeuo pipefail
 shopt -s nullglob
 
 readonly PROG="saq"
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SELF
@@ -23,6 +23,8 @@ SHARE="${SAQ_SHARE:-${SELF%/*}/../share/saq}"
 # are linked only when the BusyBox in use provides them.
 readonly -a REQUIRED_APPLETS=(sh mount umount mkdir mknod switch_root modprobe findfs sleep cat)
 readonly -a OPTIONAL_APPLETS=(ls ln rm cp mv sync dmesg lsmod insmod rmmod blkid)
+# What the live /init needs on top (it finds media, builds the overlay, creates the live user).
+readonly -a LIVE_APPLETS=(grep sed cp chown chmod)
 
 ROOT="/"
 ACTION=""
@@ -33,6 +35,9 @@ KEEP_OLD=1
 DRY_RUN=0
 QUIET=0
 BOOT=""
+LIVE=0
+OUTPUT=""
+BUSYBOX_OPT=""
 WORK=""
 TMPOUT=""
 
@@ -57,6 +62,14 @@ Usage: saq [OPTIONS]
                          survive the package manager removing the old kernel).
   --no-keep-old          With --update-default, do not keep those copies.
   --root DIR             Operate on another root filesystem (default: /).
+  --live                 Build the initramfs of a LIVE system (finds a medium or
+                         an ISO file, e.g. on a Ventoy stick, mounts its
+                         squashfs under an overlay, creates a passwordless
+                         "live" user). Needs --kernel VERSION and --output FILE;
+                         touches nothing inside the root. Used by saq-live-iso.
+  --output FILE          With --live: where to write the image.
+  --busybox FILE         With --live: static BusyBox to use when the root has none
+                         at /usr/bin/busybox.
   --dry-run              Print planned actions without changing anything.
   --quiet                Only print warnings and errors.
   --version              Print the version and exit.
@@ -121,6 +134,28 @@ while (($#)); do
         ROOT="${1#--root=}"
         shift
         ;;
+    --live)
+        LIVE=1
+        shift
+        ;;
+    --output)
+        [[ $# -ge 2 ]] || die "--output needs a file"
+        OUTPUT="$2"
+        shift 2
+        ;;
+    --output=*)
+        OUTPUT="${1#--output=}"
+        shift
+        ;;
+    --busybox)
+        [[ $# -ge 2 ]] || die "--busybox needs a file"
+        BUSYBOX_OPT="$2"
+        shift 2
+        ;;
+    --busybox=*)
+        BUSYBOX_OPT="${1#--busybox=}"
+        shift
+        ;;
     --dry-run)
         DRY_RUN=1
         shift
@@ -148,12 +183,27 @@ done
 # With no explicit build action, build everything - except for pure lifecycle
 # calls such as "--prune --update-default" from a package-removal hook.
 if [[ "$explicit_action" == 0 && "$DO_PRUNE" == 0 ]]; then ACTION="all"; fi
+if [[ "$LIVE" == 1 ]]; then
+    [[ "$ACTION" == one && -n "$OUTPUT" ]] || die "--live needs --kernel VERSION and --output FILE"
+    [[ "$DO_PRUNE" == 0 && "$UPDATE_DEFAULT" == 0 ]] || die "--live cannot be combined with --prune or --update-default"
+elif [[ -n "$OUTPUT" || -n "$BUSYBOX_OPT" ]]; then
+    die "--output and --busybox are only for --live"
+fi
 
 [[ -d "$ROOT" ]] || die "root does not exist: $ROOT"
 ROOT="$(cd "$ROOT" && pwd -P)"
 BOOT="$ROOT/boot"
 BUSYBOX="$ROOT/usr/bin/busybox"
-[[ -d "$BOOT" ]] || die "no boot directory: $BOOT"
+if [[ "$LIVE" == 1 ]]; then
+    # a live image may be built from a root that has no static BusyBox of its own
+    if [[ -n "$BUSYBOX_OPT" ]]; then
+        BUSYBOX="$BUSYBOX_OPT"
+    elif [[ ! -x "$BUSYBOX" ]] && command -v busybox >/dev/null 2>&1; then
+        BUSYBOX="$(command -v busybox)"
+    fi
+else
+    [[ -d "$BOOT" ]] || die "no boot directory: $BOOT"
+fi
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -204,6 +254,11 @@ check_busybox() {
     for applet in "${REQUIRED_APPLETS[@]}"; do
         grep -qx "$applet" <<<"$applets" || die "BusyBox is missing the '$applet' applet; rebuild busybox"
     done
+    if [[ "$LIVE" == 1 ]]; then
+        for applet in "${LIVE_APPLETS[@]}"; do
+            grep -qx "$applet" <<<"$applets" || die "BusyBox is missing the '$applet' applet the live init needs; use a full static BusyBox (--busybox)"
+        done
+    fi
     BUSYBOX_APPLETS="$applets"
 }
 
@@ -213,6 +268,7 @@ load_module_list() {
     local -A excluded=() seen=()
     local f line tok name
     [[ -r "$SHARE/modules.list" ]] || die "module list not found: $SHARE/modules.list"
+    if [[ "$LIVE" == 1 && -r "$SHARE/modules-live.list" ]]; then files+=("$SHARE/modules-live.list"); fi
     files+=("$ROOT"/etc/saq/modules.d/*.list)
     for f in "${files[@]}"; do
         [[ -r "$f" ]] || continue
@@ -303,13 +359,21 @@ stage_firmware() {
 
 build_one() {
     local ver="$1"
-    local kernel="$BOOT/vmlinuz-$ver" out="$BOOT/initramfs-$ver.img"
+    local kernel="$BOOT/vmlinuz-$ver" out="$BOOT/initramfs-$ver.img" init_src="$SHARE/init"
     local line path name rel deps fw epoch applet
     local -a modfiles=() cpio_opts=(--null -o -H newc --quiet --owner=0:0)
 
     [[ "$ver" =~ ^[A-Za-z0-9._+-]+$ ]] || die "unsafe kernel version: $ver"
-    [[ -f "$kernel" ]] || die "kernel image not found: $kernel"
     KMODDIR="$ROOT/lib/modules/$ver"
+    if [[ "$LIVE" == 1 ]]; then
+        # the kernel image is not part of the initramfs, and a live root may keep
+        # its modules under /usr/lib only (or have no /boot at all)
+        out="$OUTPUT"
+        init_src="$SHARE/init-live"
+        [[ -d "$KMODDIR" ]] || KMODDIR="$ROOT/usr/lib/modules/$ver"
+    else
+        [[ -f "$kernel" ]] || die "kernel image not found: $kernel"
+    fi
     [[ -d "$KMODDIR" ]] || die "module directory not found: $KMODDIR"
 
     if [[ "$DRY_RUN" == 1 ]]; then
@@ -323,6 +387,9 @@ build_one() {
 
     # Dependency data of the installed kernel; created on demand, like a
     # kernel package without its own depmod step would need.
+    if [[ ! -s "$KMODDIR/modules.dep" && "$LIVE" == 1 ]]; then
+        die "no modules.dep in $KMODDIR; run: depmod -b $ROOT $ver (saq-live-iso does this for tarballs)"
+    fi
     if [[ ! -s "$KMODDIR/modules.dep" ]]; then
         info "generating module dependency data for $ver"
         depmod -b "$ROOT" "$ver" || die "depmod failed for kernel $ver"
@@ -334,9 +401,11 @@ build_one() {
     TREE="$WORK/tree"
     MODULES_TREE="$TREE/lib/modules/$ver"
     mkdir -p "$TREE"/{bin,dev,proc,sys,run,etc,newroot,lib/firmware} "$MODULES_TREE"
+    if [[ "$LIVE" == 1 ]]; then mkdir -p "$TREE"/{cdrom,iso-host,ro,rw}; fi
 
     cp -- "$BUSYBOX" "$TREE/bin/busybox"
-    for applet in "${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}"; do
+    for applet in "${REQUIRED_APPLETS[@]}" "${OPTIONAL_APPLETS[@]}" "${LIVE_APPLETS[@]}"; do
+        [[ ! -e "$TREE/bin/$applet" ]] || continue
         if grep -qx "$applet" <<<"$BUSYBOX_APPLETS"; then ln -s busybox "$TREE/bin/$applet"; fi
     done
     # Console nodes need root (CAP_MKNOD). Without /dev/console in the image the
@@ -402,8 +471,8 @@ build_one() {
     fi
 
     if ((${#STAGED_NAMES[@]})); then printf '%s\n' "${STAGED_NAMES[@]}" >"$TREE/etc/modules"; else : >"$TREE/etc/modules"; fi
-    [[ -r "$SHARE/init" ]] || die "init script not found: $SHARE/init"
-    cp -- "$SHARE/init" "$TREE/init"
+    [[ -r "$init_src" ]] || die "init script not found: $init_src"
+    cp -- "$init_src" "$TREE/init"
     chmod 755 "$TREE/init"
 
     epoch="${SOURCE_DATE_EPOCH:-0}"
@@ -411,7 +480,8 @@ build_one() {
     find "$TREE" -exec touch -h -d "@$epoch" {} +
     if cpio --help 2>&1 | grep -q -- '--reproducible'; then cpio_opts+=(--reproducible); fi
 
-    TMPOUT="$BOOT/.initramfs-$ver.img.tmp.$$"
+    TMPOUT="${out%/*}/.${out##*/}.tmp.$$"
+    [[ "$out" == */* ]] || TMPOUT=".${out}.tmp.$$"
     if ! (cd "$TREE" && find . -print0 | LC_ALL=C sort -z | cpio "${cpio_opts[@]}") | gzip -n -9 >"$TMPOUT"; then
         die "failed to create the archive for $ver"
     fi
@@ -539,7 +609,7 @@ prune_images() {
 }
 
 # ---- main --------------------------------------------------------------------------
-if [[ "$DRY_RUN" != 1 && -z "${SAQ_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
+if [[ "$LIVE" != 1 && "$DRY_RUN" != 1 && -z "${SAQ_LOCKED:-}" ]] && command -v flock >/dev/null 2>&1; then
     exec 9>"$BOOT/.saq.lock"
     flock -n 9 || die "another $PROG is already running"
     export SAQ_LOCKED=1

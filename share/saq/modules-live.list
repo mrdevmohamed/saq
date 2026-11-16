@@ -1,0 +1,10 @@
+# Extra modules of the LIVE initramfs (saq --live), on top of modules.list.
+# Local additions: <root>/etc/saq/modules.d/*.list, "!name" removes one.
+
+# keyboards (for the rescue shell and `break=`), USB 3 / USB 2 hubs
+hid hid_generic usbhid
+# the data partition of a Ventoy stick is exFAT by default
+exfat
+# whole-disk and ISO-file media
+isofs iso9660 squashfs overlay loop vfat fat nls_cp437 nls_utf8 ext4 ntfs3
+dm_mod
