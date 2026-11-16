@@ -21,7 +21,7 @@ for tool in gcc cpio gzip depmod busybox; do
 done
 
 T="$(mktemp -d)"
-trap 'rm -rf -- "$T"' EXIT
+trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf -- "$T"' EXIT
 pass=0
 ok() {
     pass=$((pass + 1))
