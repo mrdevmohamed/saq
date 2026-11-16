@@ -100,6 +100,7 @@ check "exfat (Ventoy's default) is staged and listed" bash -c "grep -qx exfat '$
 
 # the images of installed systems are not affected by any of this
 mkdir -p "$ROOT/boot"
+[ -e "$ROOT/lib" ] || ln -s usr/lib "$ROOT/lib" # merged /usr, as installed systems have it
 echo k >"$ROOT/boot/vmlinuz-6.9.0-live"
 "$SAQ" --root "$ROOT" --kernel 6.9.0-live --quiet
 rm -rf "$X"
