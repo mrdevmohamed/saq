@@ -81,10 +81,12 @@ automatically (`/usr/bin/runit`, `/sbin/init`, `/usr/lib/systemd/systemd`) or gi
 `--init`. If the root has no static BusyBox (with `chown chmod grep sed cp`), pass
 `--busybox FILE`. Host tools: `mksquashfs`, `grub-mkrescue`, `xorriso`, `mtools`.
 
-Checked in QEMU (BIOS GRUB from a CD, an ISO file on a FAT partition with and without
-`iso-scan`, and `loopback.cfg`) with an Ubuntu kernel. Not yet checked: UEFI, secure boot,
-exFAT/NTFS data partitions, a real Ventoy stick. Ventoy's own boot modes are not
-under our control: use its normal or GRUB2 mode and report what happens.
+Checked in QEMU with an Ubuntu kernel: BIOS GRUB from a CD, an ISO file on a partition
+with and without `iso-scan`, and `loopback.cfg`; and a complete Ubuntu 24.04 root
+(debootstrap) built with `saq-live-iso`, booted to a `login:` prompt where `live` (empty
+password) logs in and `sudo` needs none. Not yet checked: UEFI, secure boot, exFAT/NTFS
+data partitions, a real Ventoy stick. Ventoy's own boot modes are not under our control:
+use its normal or GRUB2 mode and report what happens.
 
 Worked examples for Ubuntu/Debian, Arch, Fedora, Alpine, Void and container images: [docs/live-iso-examples.md](docs/live-iso-examples.md).
 
