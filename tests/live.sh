@@ -108,7 +108,7 @@ mkdir "$X"
 check "a normal image keeps the installed-system init" cmp -s "$X/init" "$HERE/share/saq/init"
 check "a normal image has no live applets or mount points" bash -c "test ! -e '$X/bin/chown' -a ! -d '$X/iso-host' -a ! -e '$X/bin/chmod'"
 check "a normal image does not list live-only modules" bash -c "! grep -qx isofs '$X/etc/modules'"
-rm -rf "$ROOT/boot"
+rm -rf "${ROOT:?}/boot"
 
 # ---- saq-live-iso ----------------------------------------------------------------------
 bash -n "$ISO_TOOL" && ok "saq-live-iso parses"
