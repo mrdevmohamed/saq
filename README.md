@@ -5,8 +5,9 @@ Initramfs tool for the [Faseela](https://github.com/mrdevmohamed/faseela) distro
 `saq` builds `/boot/initramfs-VERSION.img` for every kernel
 installed in `/boot`: a static BusyBox, the storage and filesystem modules from
 `modules.list` (with their dependencies and firmware) and a small `/init` that
-mounts the root filesystem and hands over to runit. That is what saq is, and
-none of it changed. Next to it, the `saq-live-iso` script turns any root filesystem
+mounts the root filesystem and hands over to the selected init. A kernel
+`init=` argument takes priority; otherwise SAQ checks its generic fallback
+candidates in order. That is what saq is, and none of it changed. Next to it, the `saq-live-iso` script turns any root filesystem
 into a bootable live ISO (see below); it uses `saq --live` for the live initramfs.
 
 The code started as faseela-repo PR #44 and lives here so it can be versioned,
@@ -124,9 +125,16 @@ kernel's `modules.dep`, and firmware named by the included modules is copied in
 
 `root=` (`/dev/..`, `UUID=`, `LABEL=`, `PARTUUID=`, `PARTLABEL=`),
 `rootfstype=`, `rootflags=`, `ro`/`rw` (default `ro`), `rootwait`,
-`rootdelay=N` (give up after N seconds, default 30), `init=` (default
-`/usr/bin/runit`), `break` / `break=postmount` (open a shell before or after
-mounting root), `quiet`.
+`rootdelay=N` (give up after N seconds, default 30), `init=` (when supplied,
+this path is tried before the generic fallback candidates `/usr/bin/runit`,
+`/sbin/init` and `/usr/sbin/init`), `break` / `break=postmount` (open a
+shell before or after mounting root), `quiet`.
+
+Faseela's installed-disk GRUB entries pass
+`init=/usr/lib/systemd/systemd` explicitly. SAQ does not infer the desired init
+from a package database or distribution profile; the bootloader supplies the
+choice as a kernel argument. Other distributions can use the same initramfs
+without changing the generic fallback order.
 
 `PARTUUID=` and `PARTLABEL=` depend on what the BusyBox `findfs` can resolve;
 prefer `UUID=`.
