@@ -11,7 +11,7 @@
 #   rootfstype=FS    rootflags=OPTS    ro | rw (default ro)
 #   rootwait         wait forever for the root device
 #   rootdelay=N      wait at most N seconds (default 30)
-#   init=PATH        init to start in the new root (default /usr/bin/runit)
+#   systemd          the only supported installed-system init
 #   break[=STAGE]    open a shell before mounting root (STAGE: premount, the
 #                    default) or after mounting it (STAGE: postmount)
 #   quiet            suppress progress messages
@@ -52,7 +52,6 @@ ROOT_FLAGS=""
 ROOT_MODE="ro"
 WAIT_LIMIT=30
 WAIT_FOREVER=0
-INIT_ARG=""
 BREAK=""
 
 set -f # a '*' on the command line must not be glob-expanded below
@@ -64,7 +63,6 @@ for arg in $(cat /proc/cmdline); do
     rootflags=*) ROOT_FLAGS="${arg#rootflags=}" ;;
     rootwait) WAIT_FOREVER=1 ;;
     rootdelay=*) WAIT_LIMIT="${arg#rootdelay=}" ;;
-    init=*) INIT_ARG="${arg#init=}" ;;
     break) BREAK="premount" ;;
     break=*) BREAK="${arg#break=}" ;;
     quiet) QUIET=1 ;;
@@ -152,15 +150,8 @@ fi
 maybe_break postmount
 
 # ---- hand over ----------------------------------------------------------
-NEW_INIT=""
-for candidate in "$INIT_ARG" /usr/bin/runit /sbin/init /usr/sbin/init; do
-    [ -n "$candidate" ] || continue
-    if [ -x "/newroot$candidate" ]; then
-        NEW_INIT="$candidate"
-        break
-    fi
-done
-[ -n "$NEW_INIT" ] || rescue "no init found in the new root (tried ${INIT_ARG:+$INIT_ARG }/usr/bin/runit /sbin/init /usr/sbin/init)"
+NEW_INIT=/usr/lib/systemd/systemd
+[ -x "/newroot$NEW_INIT" ] || rescue "systemd is missing from the new root ($NEW_INIT)"
 
 mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run 2>/dev/null || true
 mount -o move /dev /newroot/dev || rescue "cannot move /dev"
