@@ -93,6 +93,8 @@ X="$T/x"
 mkdir "$X"
 (cd "$X" && gzip -dc "$T/live.img" | cpio -idm --quiet)
 check "image has the live init" cmp -s "$X/init" "$INIT"
+check "live init selects systemd only" grep -q '^NEW_INIT=/usr/lib/systemd/systemd$' "$X/init"
+check "live init has no runit fallback" bash -c "! grep -q runit '$X/init'"
 check "image has the mount points" test -d "$X/iso-host" -a -d "$X/cdrom" -a -d "$X/ro" -a -d "$X/rw"
 check "live applets are linked (chown, chmod, grep, sed, cp)" bash -c "for a in chown chmod grep sed cp; do test -L '$X/bin/'\$a || exit 1; done"
 check "isofs is staged and listed" bash -c "grep -qx isofs '$X/etc/modules'"
@@ -121,16 +123,16 @@ rc=0
 "$ISO_TOOL" --bogus "$ROOT" "$T/o.iso" >/dev/null 2>&1 || rc=$?
 check "unknown option exits non-zero" test "$rc" != 0
 rc=0
-"$ISO_TOOL" --init relative "$ROOT" "$T/o.iso" >/dev/null 2>&1 || rc=$?
-check "--init must be absolute" test "$rc" != 0
+"$ISO_TOOL" --init /usr/bin/runit "$ROOT" "$T/o.iso" >/dev/null 2>&1 || rc=$?
+check "legacy --init override is rejected" test "$rc" != 0
 
 if command -v mksquashfs >/dev/null && command -v grub-mkrescue >/dev/null && command -v xorriso >/dev/null && command -v mformat >/dev/null; then
     printf 'root:x:0:0:r:/root:/bin/sh\n' >"$ROOT/etc/passwd"
     printf 'root:x:0:\nwheel:x:10:\n' >"$ROOT/etc/group"
-    mkdir -p "$ROOT/boot" "$ROOT/usr/sbin"
+    mkdir -p "$ROOT/boot" "$ROOT/usr/lib/systemd"
     echo "fake kernel" >"$ROOT/boot/vmlinuz-6.9.0-live"
-    printf '#!/bin/sh\n' >"$ROOT/usr/sbin/init"
-    chmod 755 "$ROOT/usr/sbin/init"
+    printf '#!/bin/sh\n' >"$ROOT/usr/lib/systemd/systemd"
+    chmod 755 "$ROOT/usr/lib/systemd/systemd"
     # no kernel image: refused with a hint (a directory is never modified)
     mv "$ROOT/boot/vmlinuz-6.9.0-live" "$T/k"
     rc=0
@@ -138,7 +140,7 @@ if command -v mksquashfs >/dev/null && command -v grub-mkrescue >/dev/null && co
     check "a root without a kernel image is refused" bash -c "test $rc != 0 && grep -q -- '--kernel FILE' '$T/err'"
     mv "$T/k" "$ROOT/boot/vmlinuz-6.9.0-live"
     BEFORE="$(cd "$ROOT" && find . | sort)"
-    "$ISO_TOOL" --vol-id TESTLIVE --init /usr/sbin/init "$ROOT" "$T/live.iso" >"$T/log" 2>&1 || {
+    "$ISO_TOOL" --vol-id TESTLIVE "$ROOT" "$T/live.iso" >"$T/log" 2>&1 || {
         cat "$T/log" >&2
         fail "saq-live-iso builds an ISO from a directory"
     }
@@ -150,7 +152,8 @@ if command -v mksquashfs >/dev/null && command -v grub-mkrescue >/dev/null && co
     done
     xorriso -osirrox on -indev "$T/live.iso" -extract /boot/grub "$T/grub" >/dev/null 2>&1
     check "grub.cfg has three entries" test "$(grep -c '^menuentry' "$T/grub/grub.cfg")" = 3
-    check "every kernel line carries \${isoparam} and init=" test "$(grep -c '^    linux .*init=/usr/sbin/init .*\${isoparam}' "$T/grub/grub.cfg")" = 3
+    check "kernel lines do not select an alternate init" bash -c "! grep -q 'init=' '$T/grub/grub.cfg'"
+    check "kernel lines retain the ISO locator" test "$(grep -c '^    linux .*\${isoparam}' "$T/grub/grub.cfg")" = 3
     check "loopback.cfg has the same entries" test "$(grep -c '^menuentry' "$T/grub/loopback.cfg")" = 3
     check "Ventoy's iso_path becomes iso-scan/filename" grep -q 'set isoparam="iso-scan/filename=${iso_path}"' "$T/grub/grub.cfg"
     check "isoparam is defined before the first entry" bash -c "test \$(grep -n 'set isoparam=\"\"' '$T/grub/grub.cfg' | head -1 | cut -d: -f1) -lt \$(grep -n '^menuentry' '$T/grub/grub.cfg' | head -1 | cut -d: -f1)"
@@ -158,7 +161,7 @@ if command -v mksquashfs >/dev/null && command -v grub-mkrescue >/dev/null && co
     # tarball input (root needed for ownership; skipped otherwise)
     if [[ "$EUID" -eq 0 ]]; then
         (cd "$T" && tar -czf root.tar.gz -C "$ROOT" .)
-        "$ISO_TOOL" --init /usr/sbin/init "$T/root.tar.gz" "$T/tar.iso" >"$T/log2" 2>&1 || {
+        "$ISO_TOOL" "$T/root.tar.gz" "$T/tar.iso" >"$T/log2" 2>&1 || {
             cat "$T/log2" >&2
             fail "saq-live-iso builds an ISO from a tarball"
         }

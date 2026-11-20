@@ -110,6 +110,8 @@ mkdir "$X"
 (cd "$X" && gzip -dc "$ROOT/boot/initramfs-6.2.0-test.img" | cpio -idm --quiet)
 M="$X/lib/modules/6.2.0-test/kernel"
 check "/init is executable" test -x "$X/init"
+check "/init selects systemd only" grep -q '^NEW_INIT=/usr/lib/systemd/systemd$' "$X/init"
+check "/init has no runit fallback" bash -c "! grep -q runit '$X/init'"
 check "/init matches the shipped script" cmp -s "$X/init" "$HERE/share/saq/init"
 check "/init reopens /dev/console after mounting devtmpfs" grep -q '^    exec </dev/console >/dev/console 2>&1' "$X/init"
 check "busybox is included" test -x "$X/bin/busybox"

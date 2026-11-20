@@ -15,7 +15,7 @@
 #
 # Kernel command line understood:
 #   iso-scan/filename=/PATH.iso | findiso=/PATH.iso   the ISO file (optional)
-#   init=PATH        init to start (default: runit, /sbin/init, systemd, ...)
+#   systemd          the only supported live-system init
 #   rootdelay=N      wait at most N seconds for the medium (default 30)
 #   nopersist        ignore a persistence partition
 #   nolive           no live user, no empty root password
@@ -48,7 +48,6 @@ if { : </dev/console >/dev/console; } 2>/dev/null; then
 fi
 
 # ---- kernel command line ------------------------------------------------
-INIT_ARG=""
 ISO_HINT=""
 WAIT_LIMIT=30
 NOPERSIST=0
@@ -59,7 +58,6 @@ set -f # a '*' on the command line must not be glob-expanded below
 # shellcheck disable=SC2013 # splitting into words is exactly what we want
 for arg in $(cat /proc/cmdline); do
     case "$arg" in
-    init=/*) INIT_ARG="${arg#init=}" ;;
     iso-scan/filename=*) ISO_HINT="${arg#iso-scan/filename=}" ;;
     findiso=*) ISO_HINT="${arg#findiso=}" ;;
     rootdelay=*) WAIT_LIMIT="${arg#rootdelay=}" ;;
@@ -242,15 +240,8 @@ fi
 maybe_break postmount
 
 # ---- hand over ----------------------------------------------------------
-NEW_INIT=""
-for candidate in "$INIT_ARG" /usr/bin/runit /sbin/init /usr/sbin/init /usr/lib/systemd/systemd; do
-    [ -n "$candidate" ] || continue
-    if [ -x "/newroot$candidate" ]; then
-        NEW_INIT="$candidate"
-        break
-    fi
-done
-[ -n "$NEW_INIT" ] || rescue "no init found in the live root (tried ${INIT_ARG:+$INIT_ARG }/usr/bin/runit /sbin/init /usr/sbin/init /usr/lib/systemd/systemd)"
+NEW_INIT=/usr/lib/systemd/systemd
+[ -x "/newroot$NEW_INIT" ] || rescue "systemd is missing from the live root ($NEW_INIT)"
 
 mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run /newroot/cdrom 2>/dev/null || true
 mount -o move /dev /newroot/dev || rescue "cannot move /dev"
