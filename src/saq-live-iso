@@ -20,8 +20,6 @@
 # Options:
 #   --kernel-version V   kernel to use (default: the newest in lib/modules)
 #   --kernel FILE        kernel image (default: looked up in the root's /boot)
-#   --init PATH          init to start in the live root (default: runit, /sbin/init,
-#                        /usr/lib/systemd/systemd, whichever exists)
 #   --busybox FILE       static busybox for the initramfs (default: the root's, else the host's)
 #   --vol-id NAME        ISO volume id (default LIVE)
 #   --compression C      xz (default), zstd or gzip
@@ -45,7 +43,7 @@ die() {
 info() { echo "== $PROG: $*"; }
 usage() { sed -n '2,/^set -Eeuo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
-ROOTFS="" OUT="" KVER="" KERNEL_FILE="" INIT="" BUSYBOX_FILE=""
+ROOTFS="" OUT="" KVER="" KERNEL_FILE="" BUSYBOX_FILE=""
 VOL_ID="LIVE" COMP="xz" SERIAL=0 EXTRA_ARGS=""
 while (($#)); do
     case "$1" in
@@ -53,12 +51,11 @@ while (($#)); do
         usage
         exit 0
         ;;
-    --kernel-version | --kernel | --init | --busybox | --vol-id | --compression | --kernel-args)
+    --kernel-version | --kernel | --busybox | --vol-id | --compression | --kernel-args)
         [[ $# -ge 2 ]] || die "$1 needs a value"
         case "$1" in
         --kernel-version) KVER="$2" ;;
         --kernel) KERNEL_FILE="$2" ;;
-        --init) INIT="$2" ;;
         --busybox) BUSYBOX_FILE="$2" ;;
         --vol-id) VOL_ID="$2" ;;
         --compression) COMP="$2" ;;
@@ -87,7 +84,6 @@ done
     usage >&2
     exit 2
 }
-[[ -z "$INIT" || "$INIT" == /* ]] || die "--init must be an absolute path inside the root (got '$INIT')"
 [[ -z "$KERNEL_FILE" || -f "$KERNEL_FILE" ]] || die "kernel file not found: $KERNEL_FILE"
 [[ "$VOL_ID" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "--vol-id: letters, digits, _ . - only (max 32)"
 case "$COMP" in
@@ -133,6 +129,7 @@ else
     die "$ROOTFS is neither a directory nor a file"
 fi
 [[ -d "$ROOT/usr" || -d "$ROOT/etc" ]] || die "$ROOTFS does not look like a root filesystem (no /usr, no /etc)"
+[[ -x "$ROOT/usr/lib/systemd/systemd" ]] || die "Faseela live roots must provide /usr/lib/systemd/systemd"
 for f in etc/passwd etc/group; do [[ -f "$ROOT/$f" ]] || die "the root has no /$f (the live user cannot be created)"; done
 for p in proc sys dev run; do
     if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$ROOT/$p"; then
@@ -184,8 +181,6 @@ mksquashfs "$ROOT" "$ISO/live/rootfs.squashfs" -comp "$COMP" "${COMP_OPTS[@]}" \
 # ---- GRUB: BIOS + UEFI, plus loopback.cfg for ISO-as-a-file -------------------------
 CONSOLE="console=tty0"
 [[ "$SERIAL" != 1 ]] || CONSOLE="console=ttyS0,115200 console=tty0"
-INITARG=""
-[[ -z "$INIT" ]] || INITARG="init=$INIT "
 EXTRA=""
 [[ -z "$EXTRA_ARGS" ]] || EXTRA="$EXTRA_ARGS "
 
@@ -198,17 +193,17 @@ set default=0
 set timeout=5
 
 menuentry "Live system" {
-    linux /boot/vmlinuz quiet ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    linux /boot/vmlinuz quiet ${EXTRA}\${isoparam} $CONSOLE
     initrd /boot/initramfs.img
 }
 
 menuentry "Live system (without persistence)" {
-    linux /boot/vmlinuz quiet nopersist ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    linux /boot/vmlinuz quiet nopersist ${EXTRA}\${isoparam} $CONSOLE
     initrd /boot/initramfs.img
 }
 
 menuentry "Live system (verbose)" {
-    linux /boot/vmlinuz loglevel=7 ${INITARG}${EXTRA}\${isoparam} $CONSOLE
+    linux /boot/vmlinuz loglevel=7 ${EXTRA}\${isoparam} $CONSOLE
     initrd /boot/initramfs.img
 }
 ENTRIES
